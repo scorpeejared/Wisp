@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core window permissions. Wisp grants nothing beyond the defaults — no filesystem, shell, or network plugins are enabled, because the Rust side does all privileged work and the webview is only ever a renderer.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

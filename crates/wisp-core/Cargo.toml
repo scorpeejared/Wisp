@@ -1,0 +1,30 @@
+[package]
+name = "wisp-core"
+description = "Identity file format, key derivation, and USB binding primitives for Wisp."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+zeroize.workspace = true
+subtle.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+hkdf.workspace = true
+rand_core.workspace = true
+
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+bip39 = "2.1"
+
+# The identity key *is* the Signal identity key — one key, not an account key
+# plus a messaging key. That makes libsignal a dependency of the identity
+# format itself, and means building this crate needs `protoc` on PATH.
+libsignal-protocol = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.4" }
+rand = "0.9"
+
+[dev-dependencies]
+hex = "0.4"

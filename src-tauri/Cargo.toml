@@ -1,0 +1,37 @@
+[package]
+name = "wisp-desktop"
+description = "Wisp — private, invite-only desktop chat."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+wisp-core = { path = "../crates/wisp-core" }
+wisp-usb = { path = "../crates/wisp-usb" }
+wisp-session = { path = "../crates/wisp-session" }
+wisp-invite = { path = "../crates/wisp-invite" }
+
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zeroize.workspace = true
+# Blocking HTTP with rustls and no async runtime of its own. Registration is a
+# single synchronous step, so pulling in a second reactor would buy nothing.
+ureq = { version = "2", features = ["json", "tls"] }
+wisp-messaging = { path = "../crates/wisp-messaging" }
+wisp-biometric = { path = "../crates/wisp-biometric" }
+wisp-machine = { path = "../crates/wisp-machine" }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+
+[features]
+# Kept for parity with the Tauri template; nothing depends on it yet.
+custom-protocol = ["tauri/custom-protocol"]

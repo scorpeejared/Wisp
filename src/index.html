@@ -1,0 +1,489 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Wisp</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main id="app">
+      <!-- Gate: nothing plugged in. -->
+      <section class="screen" data-screen="noDevice" hidden>
+        <div class="mark" aria-hidden="true"></div>
+        <h1>Insert your Wisp key</h1>
+        <p class="muted">
+          Wisp stays sealed until the USB drive holding your identity is
+          connected.
+        </p>
+      </section>
+
+      <!-- Gate: drive present, cannot be used. -->
+      <section class="screen" data-screen="unusable" hidden>
+        <div class="mark warn" aria-hidden="true"></div>
+        <h1>This drive can't be used</h1>
+        <p class="muted" data-field="reason"></p>
+        <p class="muted small" data-field="mountPoint"></p>
+      </section>
+
+      <!--
+        Gate: wrong drive. Deliberately bare — no username, no chat list, no
+        hint about the identity it is refusing.
+      -->
+      <section class="screen" data-screen="denied" hidden>
+        <div class="mark deny" aria-hidden="true"></div>
+        <h1>Access denied</h1>
+        <p class="muted">This is not the drive this identity is bound to.</p>
+      </section>
+
+      <!--
+        Gate: right drive, wrong computer. Like the wrong-drive screen this is
+        deliberately bare, but it names the actual problem so the user does not
+        go looking for a lost USB stick that is in their hand.
+      -->
+      <section class="screen" data-screen="deniedComputer" hidden>
+        <div class="mark deny" aria-hidden="true"></div>
+        <h1>Not this computer</h1>
+        <p class="muted">
+          This identity is restricted to a different computer. The drive is
+          correct.
+        </p>
+        <p class="muted small">
+          Trusted Computer Binding can only be turned off on the computer it is
+          bound to.
+        </p>
+      </section>
+
+      <!-- Gate: correct drive, awaiting passphrase. -->
+      <section class="screen" data-screen="locked" hidden>
+        <div class="mark" aria-hidden="true"></div>
+        <h1>Unlock</h1>
+        <p class="muted small" data-field="drive"></p>
+        <form data-form="unlock" autocomplete="off">
+          <label class="field">
+            <span>Passphrase</span>
+            <input
+              type="password"
+              name="passphrase"
+              autocomplete="off"
+              spellcheck="false"
+              required
+            />
+          </label>
+          <p class="error" data-field="unlockError" hidden></p>
+          <button type="submit" class="primary">Unlock</button>
+        </form>
+      </section>
+
+      <!-- Gate: blank drive, offer registration. -->
+      <section class="screen wide" data-screen="registrable" hidden>
+        <div class="mark" aria-hidden="true"></div>
+        <h1>Set up this drive</h1>
+        <p class="muted small" data-field="registerDrive"></p>
+
+        <div class="notice warn" data-field="weakBinding" hidden>
+          This drive reports no serial number. Wisp can only bind to its
+          filesystem volume ID, which reformatting destroys and which will not
+          match on macOS. A drive with a serial number is strongly preferred.
+        </div>
+
+        <form data-form="register" autocomplete="off">
+          <!--
+            Invite code first: without a valid one there is no account to be
+            had, so it is the real gate. The format is checked locally as it is
+            typed, so a typo never costs a round trip.
+          -->
+          <label class="field">
+            <span>Invite code</span>
+            <input
+              type="text"
+              name="inviteCode"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="WISP-XXXX-XXXX-XXXX-XXXX"
+              required
+            />
+          </label>
+          <p class="muted small" data-field="inviteState">
+            Ask the person who invited you. Each code works once.
+          </p>
+
+          <label class="field">
+            <span>Username</span>
+            <input
+              type="text"
+              name="username"
+              maxlength="32"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="how others will see you"
+              required
+            />
+          </label>
+
+          <label class="field">
+            <span>Passphrase</span>
+            <input
+              type="password"
+              name="passphrase"
+              autocomplete="off"
+              spellcheck="false"
+              required
+            />
+          </label>
+
+          <div class="meter" aria-hidden="true">
+            <div class="meter-fill" data-field="meterFill"></div>
+          </div>
+          <p class="muted small" data-field="strength">
+            Minimum 12 characters and 60 bits of estimated entropy.
+          </p>
+
+          <button type="button" class="ghost" data-action="generate">
+            Generate a strong phrase
+          </button>
+
+          <div class="notice" data-field="generated" hidden>
+            <p class="small">
+              Write this down and store it somewhere safe. It is shown once and
+              cannot be recovered.
+            </p>
+            <code data-field="generatedPhrase"></code>
+          </div>
+
+          <p class="muted small" data-field="biometricCapability"></p>
+
+          <div class="notice deny">
+            There is no recovery. If you lose this drive or forget this
+            passphrase, the identity is gone permanently.
+          </div>
+
+          <p class="error" data-field="registerError" hidden></p>
+          <button type="submit" class="primary">Create identity</button>
+        </form>
+      </section>
+
+      <!-- Unlocked. The only screen permitted to show app content. -->
+      <section class="screen wide" data-screen="unlocked" hidden>
+        <header class="bar">
+          <div>
+            <div class="username" data-field="username"></div>
+            <div class="muted small">
+              <span class="dot" data-field="connectionDot"></span>
+              <span data-field="connection">connecting…</span>
+            </div>
+          </div>
+          <button type="button" class="ghost small" data-action="lock">
+            Lock
+          </button>
+        </header>
+
+        <!--
+          Messages. Empty until someone has been messaged: there is no
+          directory to browse, by design.
+        -->
+        <div class="pane" data-pane="messages">
+          <div class="chats" data-field="conversationList"></div>
+
+          <form data-form="newChat" autocomplete="off">
+            <label class="field">
+              <span>Start a conversation</span>
+              <input
+                type="text"
+                name="peer"
+                placeholder="paste their identity fingerprint"
+                autocomplete="off"
+                spellcheck="false"
+                required
+              />
+            </label>
+            <p class="error" data-field="newChatError" hidden></p>
+          </form>
+
+          <button type="button" class="ghost small" data-action="newGroup">
+            New group
+          </button>
+        </div>
+
+        <!-- Creating a group. -->
+        <div class="pane scroll" data-pane="newGroup" hidden>
+          <div class="chat-header">
+            <button type="button" class="ghost small" data-action="cancelGroup">
+              ‹ Back
+            </button>
+            <strong>New group</strong>
+          </div>
+
+          <form data-form="createGroup" autocomplete="off">
+            <label class="field">
+              <span>Group name</span>
+              <input
+                type="text"
+                name="name"
+                maxlength="64"
+                placeholder="what to call it"
+                autocomplete="off"
+                required
+              />
+            </label>
+
+            <label class="field">
+              <span>Members</span>
+              <textarea
+                name="members"
+                rows="5"
+                placeholder="one identity fingerprint per line"
+                autocomplete="off"
+                spellcheck="false"
+                required
+              ></textarea>
+            </label>
+            <p class="muted small">
+              You are added automatically. Each member gets the key to read the
+              group, sent to them individually.
+            </p>
+
+            <div class="notice">
+              The relay stores nothing about groups — no name, no membership.
+              Everyone's member list is whatever the group has told them, and
+              there is no way to remove someone afterwards short of starting a
+              new group.
+            </div>
+
+            <p class="error" data-field="createGroupError" hidden></p>
+            <button type="submit" class="primary">Create group</button>
+          </form>
+        </div>
+
+        <!-- One group conversation. -->
+        <div class="pane" data-pane="groupChat" hidden>
+          <div class="chat-header">
+            <button type="button" class="ghost small" data-action="backGroup">
+              ‹ Back
+            </button>
+            <div>
+              <strong data-field="groupName"></strong>
+              <div class="muted small" data-field="groupMembers"></div>
+            </div>
+          </div>
+
+          <div class="messages" data-field="groupMessages"></div>
+
+          <p class="error" data-field="groupSendError" hidden></p>
+          <form data-form="sendGroup" autocomplete="off">
+            <input
+              type="text"
+              name="text"
+              placeholder="Message"
+              autocomplete="off"
+              maxlength="4000"
+              required
+            />
+            <button type="submit" class="primary">Send</button>
+          </form>
+        </div>
+
+        <!-- One conversation. A sub-view of Messages, not its own tab. -->
+        <div class="pane" data-pane="chat" hidden>
+          <div class="chat-header">
+            <button type="button" class="ghost small" data-action="back">
+              ‹ Back
+            </button>
+            <code class="peer" data-field="chatPeer"></code>
+          </div>
+
+          <div class="messages" data-field="messages"></div>
+
+          <p class="error" data-field="sendError" hidden></p>
+          <form data-form="send" autocomplete="off">
+            <input
+              type="text"
+              name="text"
+              placeholder="Message"
+              autocomplete="off"
+              maxlength="4000"
+              required
+            />
+            <button type="submit" class="primary">Send</button>
+          </form>
+        </div>
+
+        <!--
+          Identity. Desktop has no camera, so sharing an identity means reading
+          or pasting the fingerprint rather than scanning a code.
+        -->
+        <div class="pane scroll" data-pane="identity" hidden>
+          <h2>Your identity</h2>
+          <p class="muted small">
+            This is the key that secures your messages. Compare it with someone
+            out of band — in person, or over a call you already trust — before
+            treating a conversation as private.
+          </p>
+
+          <div class="setting">
+            <div class="muted small">Fingerprint</div>
+            <code data-field="fingerprint"></code>
+            <div class="row">
+              <button type="button" class="ghost small" data-action="copy">
+                Copy fingerprint
+              </button>
+              <button type="button" class="ghost small" data-action="copyShare">
+                Copy share line
+              </button>
+            </div>
+          </div>
+
+          <div class="setting">
+            <div class="muted small">Username</div>
+            <div data-field="identityUsername"></div>
+            <p class="muted small">
+              Usernames are stored hashed on the relay and travel inside
+              encrypted messages. They are a label, not proof of who someone is
+              — the fingerprint is.
+            </p>
+          </div>
+        </div>
+
+        <!-- Settings. -->
+        <div class="pane scroll" data-pane="settings" hidden>
+          <h2>Security</h2>
+
+          <div class="setting">
+            <div class="setting-head">
+              <strong>Trusted Computer Binding</strong>
+              <span class="badge" data-field="tcState">OFF</span>
+            </div>
+            <p class="muted small" data-field="tcDescription"></p>
+            <button
+              type="button"
+              class="ghost small"
+              data-action="toggleTrustedComputer"
+            ></button>
+          </div>
+
+          <div class="setting">
+            <div class="setting-head">
+              <strong>Biometric unlock</strong>
+              <span class="badge" data-field="bioState">OFF</span>
+            </div>
+            <p class="muted small" data-field="bioDescription"></p>
+          </div>
+
+          <div class="setting">
+            <div class="setting-head">
+              <strong>Idle lock</strong>
+              <span class="badge on" data-field="idleState">ON</span>
+            </div>
+            <p class="muted small" data-field="idleDescription"></p>
+          </div>
+
+          <h2>About</h2>
+          <div class="setting">
+            <dl class="facts">
+              <dt>Version</dt>
+              <dd data-field="aboutVersion"></dd>
+              <dt>Relay</dt>
+              <dd data-field="aboutRelay"></dd>
+              <dt>Drive</dt>
+              <dd data-field="aboutDrive"></dd>
+              <dt>Computer</dt>
+              <dd data-field="aboutComputer"></dd>
+            </dl>
+          </div>
+
+          <div class="notice deny">
+            There is no recovery. If you lose this drive or forget your
+            passphrase, this identity is gone permanently.
+          </div>
+        </div>
+
+        <nav class="tabs">
+          <button type="button" class="tab" data-tab="messages">Messages</button>
+          <button type="button" class="tab" data-tab="identity">Identity</button>
+          <button type="button" class="tab" data-tab="settings">Settings</button>
+        </nav>
+      </section>
+
+      <!--
+        Idle. The drive is still connected and the key is still held; this
+        covers the screen and nothing more.
+      -->
+      <section class="screen" data-screen="idle" hidden>
+        <div class="mark" aria-hidden="true"></div>
+        <h1>Locked</h1>
+        <p class="muted small">
+          Signed in as <span data-field="idleUsername"></span>
+        </p>
+        <p class="muted small">Your drive is still connected.</p>
+
+        <button
+          type="button"
+          class="primary"
+          data-action="hello"
+          hidden
+        >
+          Unlock with Windows Hello
+        </button>
+
+        <form data-form="resume" autocomplete="off">
+          <label class="field">
+            <span>Passphrase</span>
+            <input
+              type="password"
+              name="passphrase"
+              autocomplete="off"
+              spellcheck="false"
+              required
+            />
+          </label>
+          <p class="error" data-field="resumeError" hidden></p>
+          <button type="submit" class="ghost">Unlock with passphrase</button>
+        </form>
+      </section>
+
+      <!-- Confirming a Trusted Computer Binding change. -->
+      <section class="screen wide" data-screen="confirmBinding" hidden>
+        <div class="mark warn" aria-hidden="true"></div>
+        <h1 data-field="tcConfirmTitle"></h1>
+        <p class="muted small" data-field="tcConfirmBody"></p>
+
+        <div class="notice deny" data-field="tcConfirmWarning" hidden>
+          Trusted Computer Binding may become invalid after significant hardware
+          or operating-system changes — reinstalling Windows, or moving this
+          identity to a different Windows installation. There is no server-side
+          recovery path. If that happens, this identity cannot be opened again.
+        </div>
+
+        <form data-form="confirmBinding" autocomplete="off">
+          <label class="field">
+            <span>Passphrase</span>
+            <input
+              type="password"
+              name="passphrase"
+              autocomplete="off"
+              spellcheck="false"
+              required
+            />
+          </label>
+          <p class="error" data-field="tcConfirmError" hidden></p>
+          <div class="row">
+            <button type="button" class="ghost" data-action="cancelBinding">
+              Cancel
+            </button>
+            <button type="submit" class="primary" data-field="tcConfirmSubmit">
+              Enable
+            </button>
+          </div>
+        </form>
+      </section>
+
+      <!-- Shown only before the first status arrives. -->
+      <section class="screen" data-screen="loading">
+        <div class="mark" aria-hidden="true"></div>
+        <p class="muted">Checking for your key…</p>
+      </section>
+    </main>
+
+    <script src="main.js"></script>
+  </body>
+</html>

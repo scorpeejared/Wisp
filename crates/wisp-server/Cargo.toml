@@ -1,0 +1,40 @@
+[package]
+name = "wisp-server"
+description = "Wisp relay: invite redemption, account registration, and transient encrypted message delivery."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+wisp-core = { path = "../wisp-core" }
+wisp-invite = { path = "../wisp-invite" }
+wisp-messaging = { path = "../wisp-messaging" }
+
+thiserror.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+rand_core.workspace = true
+
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }
+base64 = "0.22"
+
+[dev-dependencies]
+hex = "0.4"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+# End-to-end coverage of the WebSocket delivery path. Test-only, so none of
+# this reaches the shipped relay binary.
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+
+[[bin]]
+name = "wisp-relay"
+path = "src/bin/relay.rs"
