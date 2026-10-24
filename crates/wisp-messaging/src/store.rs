@@ -1,23 +1,3 @@
-//! libsignal's protocol stores, backed by the encrypted [`Vault`].
-//!
-//! Every record libsignal hands us is serialised with its own
-//! `serialize()`/`deserialize()` and then encrypted before it touches disk, so
-//! the on-disk format stays libsignal's problem and the confidentiality stays
-//! ours.
-//!
-//! # Why six structs and not one
-//!
-//! libsignal's session functions take each store as a separate `&mut` argument
-//! — `&mut store.session_store, &mut store.identity_store` — so a single type
-//! implementing every trait could not be passed to them at all: it would be two
-//! mutable borrows of the same value. The stores are therefore separate types
-//! sharing one `Arc<Vault>`, which is also how libsignal's own in-memory store
-//! is shaped.
-//!
-//! The identity key pair is *not* in the vault. It comes from `identity.wisp`
-//! on the USB drive and is passed in at construction — the vault holds session
-//! and prekey material, never the root secret that protects it.
-
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -40,14 +20,10 @@ const NS_KYBER_PREKEY: &str = "kyber_prekey";
 const NS_KYBER_USED: &str = "kyber_used";
 const NS_SENDER_KEY: &str = "sender_key";
 
-/// Addresses key their records by name and device, so the same person on two
-/// devices gets two sessions rather than one that fights itself.
 fn address_key(address: &ProtocolAddress) -> Vec<u8> {
     format!("{}.{}", address.name(), address.device_id()).into_bytes()
 }
 
-/// Vault failures become `InvalidState` rather than propagating a storage type
-/// into libsignal's error space, which has no room for it.
 fn storage_error(context: &'static str, error: crate::MessagingError) -> SignalProtocolError {
     SignalProtocolError::InvalidState(context, error.to_string())
 }
@@ -109,12 +85,6 @@ impl IdentityKeyStore for WispIdentityStore {
         })
     }
 
-    /// Trust on first use.
-    ///
-    /// An unknown identity is accepted; a *changed* one is refused. Refusing the
-    /// change is what turns a relay swapping in its own key into a visible
-    /// failure rather than silent interception — the user has to re-verify the
-    /// fingerprint before traffic resumes.
     async fn is_trusted_identity(
         &self,
         address: &ProtocolAddress,
@@ -205,7 +175,6 @@ impl PreKeyStore for WispPreKeyStore {
         )
     }
 
-    /// Deleting a used one-time prekey is what makes it one-time.
     async fn remove_pre_key(&mut self, prekey_id: PreKeyId) -> Result<(), SignalProtocolError> {
         self.vault
             .delete(NS_PREKEY, &u32::from(prekey_id).to_be_bytes())
@@ -288,11 +257,6 @@ impl KyberPreKeyStore for WispKyberPreKeyStore {
         )
     }
 
-    /// Records that a (kyber, ec, base key) triple has been used.
-    ///
-    /// Recording the triple rather than deleting the prekey is what lets a
-    /// last-resort key stay usable while still catching a replay of the same
-    /// combination.
     async fn mark_kyber_pre_key_used(
         &mut self,
         kyber_prekey_id: KyberPreKeyId,
@@ -368,9 +332,6 @@ impl SenderKeyStore for WispSenderKeyStore {
 
 // --- The bundle of stores ---------------------------------------------------
 
-/// All of libsignal's stores over one encrypted vault.
-///
-/// Fields are public because that is how libsignal wants them passed.
 pub struct WispProtocolStore {
     pub vault: Arc<Vault>,
     pub identity_store: WispIdentityStore,
@@ -418,8 +379,6 @@ impl WispProtocolStore {
     }
 }
 
-/// Rebuilds an identity key pair from the 32-byte private key held on the USB
-/// drive.
 pub fn identity_from_private_key(
     private_key: &[u8],
 ) -> Result<IdentityKeyPair, SignalProtocolError> {

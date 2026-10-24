@@ -1,16 +1,7 @@
-//! The client's view of the relay.
-//!
-//! [`RelayClient`] is a trait rather than a concrete HTTP client so the access
-//! gate can be tested without a server, and so no networking crate reaches
-//! `wisp-session` — the transport lives in the Tauri layer, where it belongs.
-
 use serde::Serialize;
 
-/// What the client sends to redeem an invite and create an account.
 #[derive(Debug, Clone, Serialize)]
 pub struct RegistrationRequest {
-    pub invite_code: String,
-    /// Already normalised to canonical form.
     pub username: String,
     #[serde(serialize_with = "as_hex")]
     pub public_key: [u8; 32],
@@ -18,17 +9,9 @@ pub struct RegistrationRequest {
     pub signature: [u8; 64],
 }
 
-/// Why a relay call failed, and whether trying again could help.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelayFailure {
-    /// The request never reached the relay, or the reply never came back.
-    ///
-    /// Distinguished from `Rejected` because it decides what happens to the
-    /// invite code: an unreachable relay has almost certainly not spent it, so
-    /// the user should retry with the same code. A rejection means the relay
-    /// made a decision and retrying will get the same answer.
     Unreachable,
-    /// The relay answered, and the answer was no.
     Rejected,
 }
 
@@ -59,11 +42,6 @@ impl RelayError {
     }
 }
 
-/// Blocking client for the relay's registration endpoint.
-///
-/// Blocking on purpose: registration is a single user-initiated step inside an
-/// already-synchronous unlock flow, and making the whole session machine async
-/// to serve one request would be a poor trade.
 pub trait RelayClient: Send + Sync + 'static {
     fn register(&self, request: &RegistrationRequest) -> Result<(), RelayError>;
 }
@@ -76,13 +54,11 @@ fn as_hex_64<S: serde::Serializer>(bytes: &[u8; 64], s: S) -> Result<S::Ok, S::E
     s.serialize_str(&bytes.iter().map(|b| format!("{b:02x}")).collect::<String>())
 }
 
-/// Test doubles.
 pub mod mock {
     use std::sync::{Arc, Mutex};
 
     use super::{RegistrationRequest, RelayClient, RelayError};
 
-    /// Records what it was asked and answers however it was told to.
     #[derive(Clone, Default)]
     pub struct MockRelay {
         state: Arc<Mutex<MockState>>,
@@ -109,7 +85,6 @@ pub mod mock {
             self.state.lock().unwrap().response = error;
         }
 
-        /// Every registration attempt it received.
         pub fn requests(&self) -> Vec<RegistrationRequest> {
             self.state.lock().unwrap().seen.clone()
         }

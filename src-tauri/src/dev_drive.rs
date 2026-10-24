@@ -1,54 +1,32 @@
-//! A directory that pretends to be a removable drive.
-//!
-//! **Debug builds only.** The whole module is behind `debug_assertions`, so a
-//! release build compiles none of it and there is no way to reach it in a
-//! shipped binary. That matters: a way to fake the USB gate is precisely the
-//! thing that must not exist in something a user runs.
-//!
-//! It exists because the unlocked screens — Messages, Identity, Settings — are
-//! unreachable without a registered identity, which means unreachable without
-//! spending a real invite code and writing to a real USB stick. Being unable to
-//! look at them made UI changes unverifiable.
-//!
-//! ```text
-//! WISP_FAKE_DRIVE=C:\tmp\fake-usb cargo run -p wisp-desktop
-//! ```
-//!
-//! The directory is treated exactly as a mounted volume: the identity is
-//! written to `<dir>/.wisp/identity.wisp` by the same code that writes to a
-//! real one. Only the enumeration is faked, never the crypto or the binding.
-
 use std::path::PathBuf;
 
 use wisp_core::DeviceIdentifiers;
 use wisp_usb::{PlatformVolumeProvider, RemovableVolume, Result, VolumeProvider};
 
-/// Environment variable naming the directory to present as a drive.
 pub const FAKE_DRIVE_VAR: &str = "WISP_FAKE_DRIVE";
 
-/// The provider the app actually uses.
-///
-/// An enum rather than a trait object because [`wisp_session::Session`] and the
-/// USB watcher are both generic over the provider, and one concrete type keeps
-/// them agreeing without a second type parameter.
 pub enum AppVolumeProvider {
     Platform(PlatformVolumeProvider),
     #[cfg(debug_assertions)]
-    Fake { path: PathBuf },
+    Fake { paths: Vec<PathBuf> },
 }
 
 impl AppVolumeProvider {
-    /// Uses a fake drive when asked for one in a debug build; the real one
-    /// otherwise.
     pub fn from_env() -> Self {
         #[cfg(debug_assertions)]
-        if let Ok(path) = std::env::var(FAKE_DRIVE_VAR) {
-            let path = PathBuf::from(path);
-            eprintln!(
-                "[wisp] DEBUG BUILD: presenting {} as a removable drive",
-                path.display()
-            );
-            return Self::Fake { path };
+        if let Some(value) = std::env::var_os(FAKE_DRIVE_VAR) {
+            let paths: Vec<PathBuf> = std::env::split_paths(&value)
+                .filter(|p| !p.as_os_str().is_empty())
+                .collect();
+            if !paths.is_empty() {
+                for path in &paths {
+                    eprintln!(
+                        "[wisp] DEBUG BUILD: presenting {} as a removable drive",
+                        path.display()
+                    );
+                }
+                return Self::Fake { paths };
+            }
         }
         Self::Platform(PlatformVolumeProvider)
     }
@@ -60,35 +38,29 @@ impl VolumeProvider for AppVolumeProvider {
             Self::Platform(provider) => provider.list_removable(),
 
             #[cfg(debug_assertions)]
-            Self::Fake { path } => {
-                // A directory that has gone away is a drive that has been
-                // pulled, which makes lock-on-removal testable by deleting it.
-                if !path.is_dir() {
-                    return Ok(Vec::new());
-                }
-
-                let serial = fake_serial(path);
-
-                Ok(vec![RemovableVolume {
-                    label: Some("FAKE-DRIVE".to_string()),
-                    mount_point: path.clone(),
-                    identifiers: DeviceIdentifiers {
-                        device_serial: Some(serial),
-                        volume_serial: Some("0000-DEV0".to_string()),
-                        vendor: Some("Wisp".to_string()),
-                        product: Some("Development Drive".to_string()),
-                    },
-                }])
+            Self::Fake { paths } => {
+                Ok(paths
+                    .iter()
+                    .filter(|path| path.is_dir())
+                    .map(|path| RemovableVolume {
+                        label: Some(
+                            path.file_name()
+                                .map(|n| n.to_string_lossy().to_uppercase())
+                                .unwrap_or_else(|| "FAKE-DRIVE".to_string()),
+                        ),
+                        mount_point: path.clone(),
+                        identifiers: DeviceIdentifiers {
+                            device_serial: Some(fake_serial(path)),
+                            volume_serial: Some("0000-DEV0".to_string()),
+                            vendor: Some("Wisp".to_string()),
+                            product: Some("Development Drive".to_string()),
+                        },
+                    })
+                    .collect())
             }
         }
     }
 }
-
-/// Stable across the different spellings of the same directory.
-///
-/// Derived from the *canonical* path: `C:/x` and `C:\x` are the same folder
-/// but different strings, and hashing the raw string made the app and the
-/// seeding tool disagree about which drive this was.
 fn fake_serial(path: &std::path::Path) -> String {
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     format!(
@@ -110,7 +82,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wisp-dev-drive-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
-        let provider = AppVolumeProvider::Fake { path: dir.clone() };
+        let provider = AppVolumeProvider::Fake {
+            paths: vec![dir.clone()],
+        };
         let volumes = provider.list_removable().unwrap();
 
         assert_eq!(volumes.len(), 1);
@@ -122,30 +96,50 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Deleting the directory stands in for pulling the drive.
     #[test]
     fn a_missing_directory_reports_no_volumes() {
         let provider = AppVolumeProvider::Fake {
-            path: PathBuf::from("Z:\\definitely-not-a-real-directory"),
+            paths: vec![PathBuf::from("Z:\\definitely-not-a-real-directory")],
         };
         assert!(provider.list_removable().unwrap().is_empty());
     }
 
-    /// Two directories must not look like the same drive, or a copied identity
-    /// would appear to be on its own stick.
     #[test]
     fn different_directories_are_different_drives() {
         let a = AppVolumeProvider::Fake {
-            path: PathBuf::from("C:\\one"),
+            paths: vec![PathBuf::from("C:\\one")],
         };
         let b = AppVolumeProvider::Fake {
-            path: PathBuf::from("C:\\two"),
+            paths: vec![PathBuf::from("C:\\two")],
         };
-        // The serial is a pure function of the canonical path.
         let serial = |p: &AppVolumeProvider| match p {
-            AppVolumeProvider::Fake { path } => fake_serial(path),
+            AppVolumeProvider::Fake { paths } => fake_serial(&paths[0]),
             _ => unreachable!(),
         };
         assert_ne!(serial(&a), serial(&b));
     }
-}
+
+    #[test]
+    fn several_directories_are_several_drives() {
+        let root = std::env::temp_dir().join(format!("wisp-dev-multi-{}", std::process::id()));
+        let (one, two) = (root.join("usb-one"), root.join("usb-two"));
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::create_dir_all(&two).unwrap();
+
+        let provider = AppVolumeProvider::Fake {
+            paths: vec![one.clone(), two.clone()],
+        };
+        let volumes = provider.list_removable().unwrap();
+
+        assert_eq!(volumes.len(), 2);
+        assert_ne!(
+            volumes[0].identifiers.device_serial,
+            volumes[1].identifiers.device_serial
+        );
+        assert_eq!(volumes[0].label.as_deref(), Some("USB-ONE"));
+
+        std::fs::remove_dir_all(&one).unwrap();
+        assert_eq!(provider.list_removable().unwrap().len(), 1);
+
+        std::fs::remove_dir_all(&root).ok();
+    }}

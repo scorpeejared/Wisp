@@ -5,11 +5,10 @@ dist
 .DS_Store
 *.log
 
-# Never commit a real identity file or anything resembling one.
 *.wisp
 .wisp/
 
-# Relay database: holds account records and invite hashes.
 *.db
 *.db-wal
 *.db-shm
+/src-tauri/gen/

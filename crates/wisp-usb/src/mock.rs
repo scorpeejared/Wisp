@@ -1,15 +1,7 @@
-//! A scriptable [`VolumeProvider`] for tests.
-//!
-//! The access gate's most important behaviours — deny before prompting, wipe
-//! the key the instant the drive vanishes — are all reactions to hardware
-//! events. Reproducing those by hand with a real USB stick is slow and
-//! unrepeatable, so the whole state machine is tested against this instead.
-
 use std::sync::{Arc, Mutex};
 
 use crate::{RemovableVolume, Result, UsbError, VolumeProvider};
 
-/// A provider whose volume list can be changed at will from the test body.
 #[derive(Clone, Default)]
 pub struct MockVolumeProvider {
     state: Arc<Mutex<MockState>>,
@@ -18,7 +10,6 @@ pub struct MockVolumeProvider {
 #[derive(Default)]
 struct MockState {
     volumes: Vec<RemovableVolume>,
-    /// When set, enumeration fails — simulating a platform API error.
     failure: Option<String>,
 }
 
@@ -33,8 +24,6 @@ impl MockVolumeProvider {
         this
     }
 
-    /// Replaces the currently-visible volumes, as if drives were inserted or
-    /// removed between polls.
     pub fn set_volumes(&self, volumes: Vec<RemovableVolume>) {
         let mut state = self.state.lock().unwrap();
         state.volumes = volumes;
@@ -45,12 +34,10 @@ impl MockVolumeProvider {
         self.state.lock().unwrap().volumes.push(volume);
     }
 
-    /// Simulates every drive being pulled at once.
     pub fn remove_all(&self) {
         self.state.lock().unwrap().volumes.clear();
     }
 
-    /// Makes subsequent enumeration calls fail.
     pub fn fail_with(&self, message: &str) {
         self.state.lock().unwrap().failure = Some(message.to_string());
     }
@@ -102,7 +89,6 @@ mod tests {
         let mock = MockVolumeProvider::with_volumes(vec![volume("E:\\")]);
         mock.fail_with("access denied");
         assert!(mock.list_removable().is_err());
-        // Setting volumes again clears the failure.
         mock.set_volumes(vec![]);
         assert!(mock.list_removable().is_ok());
     }

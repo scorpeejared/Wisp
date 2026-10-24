@@ -1,17 +1,18 @@
 # Wisp
 
-Private, invite-only desktop chat for Windows and macOS. The server is a dumb
-relay; the client does all the work; access is gated by physical possession of a
+Private desktop chat for Windows and macOS with open signup: pick a username,
+get a generated passphrase, and you have an account. The server is a dumb relay;
+the client does all the work; access is gated by physical possession of a
 specific USB drive plus a passphrase.
 
-**Status: build order steps 1-6 are complete.** The USB access gate, the
-invite-only relay, Signal messaging with sealed sender, Windows Hello
+**Status: the core is built and working.** The USB access gate, the
+open-registration relay, Signal messaging with sealed sender, Windows Hello
 re-authentication, group chat, and the UI all work. **Packaging and
-distribution (step 7) remain.** See [Where this stands](#where-this-stands).
+distribution remain.** See [Where this stands](#where-this-stands).
 
-The build order was reordered once: invite codes moved ahead of messaging,
-because the relay is a shared prerequisite for both and the onboarding flow is
-incoherent without them.
+Wisp started as invite-only and now has open registration; see
+[Open registration](#open-registration) for what that changes and what it
+costs. Running a public relay is covered in [DEPLOY.md](DEPLOY.md).
 
 **Windows is the tested platform.** macOS has never been compiled or run, and
 Touch ID is deliberately unimplemented — see the notes on both below.
@@ -33,16 +34,21 @@ build scripts need it), and on Windows the MSVC C++ build tools. See
 | Path | What it is |
 | --- | --- |
 | `crates/wisp-core` | Identity file format, key schedule, USB binding derivation, passphrase policy, and the wire formats shared with the relay. No platform, UI, or network dependencies. |
-| `crates/wisp-invite` | Invite code format: generation, encoding, checksum, parsing. |
 | `crates/wisp-usb` | Removable volume discovery, platform device identifier queries, insert/remove watching. |
 | `crates/wisp-session` | The access gate state machine. Owns the only decrypted key in the process. |
-| `crates/wisp-server` | The relay: invite redemption, accounts, throttling, and transient encrypted delivery over WebSocket. |
-| `crates/wisp-admin` | Owner CLI for issuing and revoking invites and locking accounts. |
+| `crates/wisp-machine` | Identifies this computer, for Trusted Computer Binding. |
+| `crates/wisp-biometric` | Windows Hello re-authentication. |
+| `crates/wisp-messaging` | The libsignal wrapper: sessions, sealed sender, group chat, and the encrypted local vault and history. |
+| `crates/wisp-server` | The relay: open account registration, throttling, and transient encrypted delivery over WebSocket. |
+| `crates/wisp-admin` | Operator CLI for listing, locking, and unlocking accounts. |
 | `src-tauri` | Tauri shell. Thin — it holds no security logic. |
 | `src` | Frontend. Plain HTML/CSS/JS, no npm dependencies, no build step. |
 | `tools/make-icons.mjs` | Generates app icons procedurally using only Node's built-in `zlib`. |
 | `tools/check-ui.mjs` | Verifies every selector `main.js` uses exists in `index.html`. |
-| `wisp-project-prompt.md` | The original project brief. Where this README says "the spec", this is it. |
+| `tools/build-installer.mjs` | Builds the installer against a relay, refusing unless that relay is online. |
+| `Dockerfile`, `docker-compose.yml` | Build and run the relay in a container. |
+| `DEPLOY.md` | Running a relay: Docker, Cloudflare Tunnel, building installers. |
+| `SECURITY.md`, `LICENSE` | Reporting vulnerabilities; MIT license. |
 
 The security-critical logic lives in `wisp-core`, `wisp-session`, and
 `wisp-server` specifically so it can be tested exhaustively on any machine,
@@ -256,80 +262,134 @@ one OS fail to unlock on the other. They are carried for display only.
 
 ---
 
-## Invite-only onboarding
+## Open registration
 
-Codes look like `WISP-ENG1-H8FH-9J3Q-5BAA`: 64 bits of entropy in
-[Crockford base32][crockford] — so `I`/`L` decode as `1` and `O` as `0`, and the
-usual transcription mistakes self-correct — plus a 15-bit checksum.
+Anyone who can reach the relay can create an account. The setup screen asks for
+one thing — a username — and **generates the passphrase for the user**: eight
+random words from the OS CSPRNG, about 88 bits, shown once with a "I have written
+this down" confirmation. The user does not choose it, so its strength is a
+property of the generator and not of someone's imagination.
 
-The checksum earns its place: a mistyped code is caught on the client, before
-it reaches the network. Redemption is rate-limited per address, so without a
-local check a user fumbling one character would burn attempts against their own
-invite and lock themselves out of onboarding.
+The USB drive is still required. Open registration changes who may *create* an
+account, not what it takes to *open* one: the identity is written to a specific
+drive and only unlocks with that drive plus the passphrase.
 
-The relay stores **only `SHA-256` of the code**, never the code itself. A code
-is a bearer credential — anyone holding it can create an account — so a leaked
-database must yield no usable invites. `wisp-admin` prints each code once, at
-generation, and cannot recover it afterwards. (Plain SHA-256 is right here,
-unlike for a passphrase: the input is 64 bits of uniform CSPRNG output, so there
-is no dictionary to attack and nothing a slow KDF would buy.)
+### What the registration signature proves
 
-`wisp-admin` is not installed on `PATH`, so run it through cargo. The `--`
-separates cargo's own flags from the tool's; without it cargo tries to parse
-`--expires-in` itself and fails.
+The client signs `(public key, username hash)` under a domain-separated tag
+(`wisp.register.v2`). That proves the caller holds the private half of the key
+being registered, and that neither the key nor the name can be swapped by someone
+who intercepts the request. It does **not** prove anything about who the caller
+is — nothing could, with no credential to present.
+
+### What replaces the invite as the gate
+
+Nothing stops a script from asking for accounts, so the relay limits it:
+
+| Limit | Default | Purpose |
+| --- | --- | --- |
+| Accounts created per address, per hour | 5 | Caps what one machine can mint |
+| Accounts created relay-wide, per hour | 500 | Stops a many-address flood from filling the database |
+| Rejected registrations per address | 10, then a 15-minute lockout | Bad signatures are cheap to send and cost a verification each |
+| Failed authentications per key and per address | 10, then a 15-minute lockout | Stops grinding the login challenge |
+
+All are configurable; see [DEPLOY.md](DEPLOY.md). Only a *created* account spends
+signup budget, and a taken username does not count toward a lockout, so fumbling
+a name never locks a visitor out.
+
+IPv6 addresses are throttled by their /64, because a single subscriber is
+routinely handed a whole /64 and per-address limits would otherwise be
+meaningless.
+
+Be clear about what this does and does not buy:
+
+- It makes bulk account creation slow and visible. It does **not** make it
+  impossible: someone with many addresses is limited only by the relay-wide cap.
+- The relay-wide cap is a trade. Hit it and real visitors are turned away until
+  the window resets. That is the price of not letting the database be flooded.
+- There is no CAPTCHA, email check, or proof of work. Adding one is a reasonable
+  next step if the relay attracts abuse.
+- A taken-username attempt is free, so usernames can be probed for availability.
+  They are stored hashed, but "is `alice` taken?" is answerable.
+
+Moderation is by public key — usernames are hashed and cannot be listed:
 
 ```bash
-cargo run -q -p wisp-admin -- new --expires-in 7d --note "for bob"
-cargo run -q -p wisp-admin -- list
-cargo run -q -p wisp-admin -- revoke WISP-ENG1-H8FH-9J3Q-5BAA
+cargo run -q -p wisp-admin -- accounts
 cargo run -q -p wisp-admin -- lock <public-key-hex> --for 24h
+cargo run -q -p wisp-admin -- unlock <public-key-hex>
 ```
 
-Or call the built binary directly, which needs no `--`:
-
-```bash
-./target/debug/wisp-admin new --expires-in 7d --note "for bob"
-```
-
-Both default to `wisp.db` in the working directory — the same file
-`wisp-relay` defaults to, so running everything from the repository root makes
-them line up with no configuration.
+`wisp-admin` is not installed on `PATH`, so run it through cargo; the `--`
+separates cargo's own flags from the tool's. Or call the built binary directly:
+`./target/debug/wisp-admin accounts`. Both default to `wisp.db` in the working
+directory — the same file `wisp-relay` defaults to.
 
 ### Registration ordering
 
-Registration is sequenced so a failure never spends a single-use code for
-nothing:
+Registration is sequenced so a failure never leaves a half-made account:
 
-1. Check the code's format **locally** — a typo costs no round trip.
-2. Enforce the passphrase and username rules. Nothing written, nothing sent.
-3. Generate and seal the identity.
-4. **Stage** the file to the drive. This proves the drive is writable *before*
-   the invite is spent; discovering a full or write-protected drive afterwards
-   would consume the code and leave the user with no way back.
-5. Redeem with the relay.
-6. Commit the staged file.
+1. Enforce the username rules. Nothing written, nothing sent.
+2. Generate and seal the identity.
+3. **Stage** the file to the drive. This proves the drive is writable *before*
+   the account exists; discovering a full or write-protected drive afterwards
+   would leave a registered username with no identity file behind it.
+4. Register with the relay.
+5. Commit the staged file.
 
-If step 5 fails, the staged file is discarded and the drive is left exactly as
+If step 4 fails, the staged file is discarded and the drive is left exactly as
 it was. Unreachable-relay and rejected-by-relay are distinguished, because they
-decide whether the user should retry with the same code.
+decide whether trying again could help.
 
-[crockford]: https://www.crockford.com/base32.html
+One edge this does not close: if the relay creates the account but the reply is
+lost, a retry generates a *new* key and finds its username taken by the first.
+The user picks another name; the orphaned account is harmless but is not cleaned
+up.
+## Switching drives
+
+Each drive holds one identity, so with more than one plugged in the gate cannot
+know which you mean. Every gate screen has **Use a different drive**, and the
+unlocked view has **Switch drive**; both open a list of the drives present, each
+marked as holding an identity or blank. Choosing one makes that drive the
+session's drive.
+
+- **Switching locks.** The key belongs to the drive it was unlocked from, so
+  choosing another wipes it and stops messaging first. Nothing carries over
+  from one identity to the next.
+- **The gate still applies.** A chosen drive goes through the same checks as any
+  other: one carrying a copied identity is still denied, never offered a fresh
+  setup over it.
+- **The choice lasts until that drive is pulled**, after which the app goes back
+  to considering every drive.
+- Each identity keeps its own message history, stored under its own key, so
+  moving between two accounts does not mix them.
+
+To try two users on one machine without two USB sticks, a debug build accepts
+several folders as fake drives, separated like `PATH` (`;` on Windows):
+
+```powershell
+$env:WISP_FAKE_DRIVE = "C:\tmp\usb-a;C:\tmp\usb-b"; cargo run -p wisp-desktop
+```
+
+Create the folders first. Removing a folder acts like pulling that drive. This is
+compiled out of release builds.
 
 ## What the relay knows
 
-Public keys, hashed usernames, invite records, and blobs it cannot read.
+Public keys, hashed usernames, and blobs it cannot read. Also, transiently,\nthe address each request came from, for throttling.
 
 Usernames are stored **only as a SHA-256 digest**. Uniqueness still works — the
 digest is the unique index — but the relay holds no browsable directory of who
 uses Wisp, and cannot be compelled to produce one. Nothing needs the plaintext:
-users find each other by fingerprint (spec §5), and a display name travels
+users find each other by fingerprint, and a display name travels
 inside the encrypted payload.
 
 Delivery and deletion happen in one transaction, so there is no window in which
 a delivered message is still on disk.
 
-`POST /v1/register`, `POST /v1/auth/challenge`, `POST /v1/auth/verify`, and
-`GET /v1/ws`. There is no message-history endpoint, no user search, and no
+`POST /v1/register`, `POST /v1/auth/challenge`, `POST /v1/auth/verify`,
+`GET /v1/ws`, and `GET /v1/whoami` (tells a caller the address it will be
+rate-limited on, for checking a deployment's proxy setup). There is no message-history endpoint, no user search, and no
 presence — none could exist without the server holding something it may not.
 
 WebSocket authentication happens as the first *frame*, not a query parameter,
@@ -356,8 +416,8 @@ cargo test --workspace
 # Relay (defaults: wisp.db, 127.0.0.1:8080)
 WISP_DB=wisp.db WISP_BIND=127.0.0.1:8080 cargo run -p wisp-server --bin wisp-relay
 
-# Issue an invite against that same database
-cargo run -p wisp-admin -- --db wisp.db new --expires-in 7d --note "for bob"
+# Moderate accounts on that same database
+cargo run -p wisp-admin -- --db wisp.db accounts
 
 # Desktop app (defaults to http://127.0.0.1:8080)
 WISP_RELAY_URL=http://127.0.0.1:8080 cargo run -p wisp-desktop
@@ -371,9 +431,10 @@ server.
 
 TLS is not handled by the relay — it expects a terminating proxy (Caddy or
 nginx with Let's Encrypt), which is less code in the security-critical path.
-**Behind a proxy the throttling scope needs a trusted forwarded-header reading**
-(see `ClientScope` in `routes.rs`); an untrusted `X-Forwarded-For` would let any
-caller choose their own rate-limit bucket.
+Behind a proxy, set `WISP_TRUST_PROXY=1` so throttling sees each visitor's real
+address; leave it unset otherwise, because an untrusted `X-Forwarded-For` would
+let any caller choose their own rate-limit bucket. The full recipe is in
+[DEPLOY.md](DEPLOY.md).
 
 `list_volumes` prints what Wisp can see and what it would bind to — useful for
 checking a specific stick reports a device serial *before* registering an
@@ -389,10 +450,10 @@ cargo tauri build               # requires: cargo install tauri-cli
 
 ## Where this stands
 
-### One spec requirement that cannot be met
+### Failed passphrase attempts cannot be rate-limited by the relay
 
-The spec asks for failed **passphrase** attempts to be rate-limited
-server-side. That is not achievable and the code does not pretend otherwise.
+It would be natural to rate-limit failed **passphrase** attempts server-side.
+That is not achievable and the code does not pretend otherwise.
 
 The passphrase decrypts `identity.wisp` locally, offline, with the relay
 unreachable. The server never observes an attempt, and an attacker holding the
@@ -402,8 +463,9 @@ be defeated by a patched client — precisely the attacker in question.
 What defends that path is on the client: Argon2id at 128 MiB per guess, an
 enforced entropy floor, and the device fingerprint being a required key input.
 
-What the relay *can* enforce, and does: invite-redemption attempts per address,
-authentication attempts per public key and per address, and account lockout.
+What the relay *can* enforce, and does: account creation per address and
+relay-wide, rejected registrations per address, authentication attempts per
+public key and per address, and account lockout.
 
 ### Verified
 
@@ -421,17 +483,19 @@ authentication attempts per public key and per address, and account lockout.
 
 Relay behaviours with dedicated tests:
 
-- An invite works **exactly once**, and redemption plus account creation happen
-  in one transaction, so concurrent redemption cannot double-spend.
-- A failed registration (duplicate username) **rolls the redemption back** —
-  the code stays usable.
-- A client cannot tell an unknown code from a spent one, so redemption is not
-  an oracle for which codes exist.
-- The registration signature binds invite, key, and username together, so an
-  intercepted code cannot be rebound to an attacker's key.
-- A username clash does **not** count toward lockout — a fumbled signup must
-  not lock a user out of onboarding.
-- A challenge is consumed whether or not it verifies, so one nonce cannot be
+- Anyone can register with just a username and a key, and a leftover
+  `invite_code` field from an old client is ignored and grants nothing.
+- The registration signature binds key and username together, so an intercepted
+  registration cannot be rebound to an attacker's key or name; a signature from
+  the invite era (`wisp.register.v1`) does not verify.
+- One address cannot create more than its per-hour allowance, the relay-wide cap
+  holds across addresses, and a lapsed window restarts the count.
+- A refused registration (taken name, bad name) spends no signup budget, and a
+  username clash does **not** count toward lockout — a fumbled signup must not
+  lock a user out.
+- Repeated bad signatures lock the sending address out.
+- `X-Forwarded-For` is ignored unless the relay was told to trust its proxy;
+  when trusted, only the last entry is believed, and IPv6 collapses to a /64.- A challenge is consumed whether or not it verifies, so one nonce cannot be
   ground on.
 - A token stops working the moment the account is locked.
 
@@ -598,7 +662,7 @@ test to prove it.
 
 The cryptographic version would use `KeyCredentialManager` for a TPM-backed key,
 wrap the identity key with it, and let idle wipe the plaintext. That is a larger
-change than the spec called for; it is the upgrade path if the idle lock ever
+change than the current design needs; it is the upgrade path if the idle lock ever
 needs to be more than a screen cover.
 
 Resuming with a passphrase is throttled on the same counter as the initial
@@ -610,13 +674,13 @@ a branch nobody runs. It needs a `LocalAuthentication` bridge and a Mac.
 
 ### Next
 
-Steps 1–6 are complete (access gate, invites, messaging, biometrics, group
-chat, UI). Remaining:
+The access gate, open registration, messaging, biometrics, group chat, and the UI
+are done. Remaining:
 
-7. **Deployment** — installer packaging and distribution.
-
-And the standing items: a real macOS build, a hardware pass with a real USB
-drive, TLS/proxy configuration, and the event-driven USB removal upgrade.
+- **Packaging and distribution** — installers, and a relay your friends can reach.
+- A real macOS build.
+- A hardware pass with a real USB drive.
+- The event-driven USB removal upgrade.
 
 ## License
 

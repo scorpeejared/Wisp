@@ -1,37 +1,3 @@
-//! Key derivation and authenticated encryption for the identity file.
-//!
-//! No custom cryptography lives here. The primitives are Argon2id (memory-hard
-//! passphrase stretching), HKDF-SHA256 (key separation), and
-//! XChaCha20-Poly1305 (AEAD). This module only wires them together.
-//!
-//! # Why the AEAD key needs the device, not just the passphrase
-//!
-//! The obvious construction — `key = Argon2id(passphrase)` and store the
-//! binding value alongside for comparison — gives the binding check no
-//! cryptographic weight at all. The binding value sits in the file, so an
-//! attacker holding a copied `identity.wisp` just skips the comparison and
-//! brute-forces the passphrase offline.
-//!
-//! Wisp instead folds the device fingerprint into the key schedule:
-//!
-//! ```text
-//! file_key  = Argon2id(passphrase, kdf_salt)
-//! aead_key  = HKDF-SHA256(ikm = file_key, salt = SHA256(fingerprint), info)
-//! ```
-//!
-//! `SHA256(fingerprint)` is never written to the file. The stored binding value
-//! is a *separately salted* HMAC of the same fingerprint, which is enough to
-//! answer "is this the right drive?" but does not hand over the HKDF salt.
-//!
-//! The consequence: someone who copies the identity file off the drive but
-//! never read the drive's descriptors cannot mount an offline passphrase
-//! attack, because they are missing an input to the key. Someone who *did*
-//! read the real drive's descriptors can reconstruct the fingerprint and is
-//! back to passphrase-only strength — which is exactly the honest boundary
-//! described in the "Known limitation" section of the spec. This construction
-//! raises the floor; it does not turn a commodity USB stick into a security
-//! element.
-
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{
     aead::{Aead, Payload},
@@ -54,29 +20,20 @@ pub const TAG_LEN: usize = 16;
 
 const HKDF_INFO: &[u8] = b"wisp.identity.v1.aead-key";
 
-/// Argon2id cost parameters, stored in the identity file so they can be raised
-/// in later builds without breaking existing files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KdfParams {
-    /// Memory cost in KiB.
     pub m_cost: u32,
-    /// Iterations.
     pub t_cost: u32,
-    /// Parallelism lanes.
     pub p_cost: u32,
 }
 
 impl KdfParams {
-    /// Roughly 0.5-1s on a 2020-or-later desktop CPU. Unlock is infrequent and
-    /// the key is high value, so this is priced for the attacker, not for us.
     pub const RECOMMENDED: Self = Self {
-        m_cost: 128 * 1024, // 128 MiB
+        m_cost: 128 * 1024,
         t_cost: 4,
         p_cost: 1,
     };
 
-    /// Deliberately weak parameters, for tests only. Using these for a real
-    /// identity would make offline passphrase attacks cheap.
     pub const INSECURE_FOR_TESTS: Self = Self {
         m_cost: 8,
         t_cost: 1,
@@ -96,7 +53,6 @@ impl Default for KdfParams {
     }
 }
 
-/// Fills `buf` with cryptographically secure random bytes.
 pub fn fill_random(buf: &mut [u8]) {
     OsRng.fill_bytes(buf);
 }
@@ -107,8 +63,6 @@ pub fn random_array<const N: usize>() -> [u8; N] {
     out
 }
 
-/// Stretches the passphrase. This is the expensive step; call it once per
-/// unlock attempt, never in a loop.
 pub fn derive_file_key(
     passphrase: &[u8],
     kdf_salt: &[u8; KDF_SALT_LEN],
@@ -122,10 +76,6 @@ pub fn derive_file_key(
     Ok(key)
 }
 
-/// Binds the stretched passphrase to a specific physical device.
-///
-/// `fingerprint_hash` is `SHA256` over the canonical device fingerprint and is
-/// never persisted — see the module docs for why that matters.
 pub fn derive_aead_key(file_key: &SecretBytes, fingerprint_hash: &[u8; 32]) -> Result<SecretBytes> {
     let hk = Hkdf::<Sha256>::new(Some(fingerprint_hash), file_key.as_slice());
     let mut key = SecretBytes::zeroed(KEY_LEN);
@@ -146,10 +96,6 @@ pub fn aead_encrypt(
         .map_err(|_| Error::Encrypt)
 }
 
-/// Decrypts into protected memory.
-///
-/// Every failure mode collapses to [`Error::Decrypt`]; see the note on that
-/// variant.
 pub fn aead_decrypt(
     key: &SecretBytes,
     nonce: &[u8; NONCE_LEN],
@@ -160,7 +106,6 @@ pub fn aead_decrypt(
     let mut plaintext = cipher
         .decrypt(XNonce::from_slice(nonce), Payload { msg: ciphertext, aad })
         .map_err(|_| Error::Decrypt)?;
-    // Move into locked, self-wiping memory and clear the AEAD's own output Vec.
     Ok(SecretBytes::from_slice_mut(&mut plaintext))
 }
 
@@ -215,8 +160,6 @@ mod tests {
         assert!(matches!(attempt, Err(Error::Decrypt)));
     }
 
-    /// The property the whole binding design rests on: the right passphrase on
-    /// the wrong physical device still cannot decrypt.
     #[test]
     fn right_passphrase_wrong_device_fails() {
         let salt = [0u8; KDF_SALT_LEN];

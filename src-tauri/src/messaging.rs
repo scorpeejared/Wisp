@@ -1,22 +1,3 @@
-//! The app's messaging session.
-//!
-//! Owns the [`Messenger`], the relay WebSocket, and the encrypted history for
-//! one unlocked identity. Created on unlock, destroyed on lock — the messaging
-//! key material must not outlive the USB drive that protects it.
-//!
-//! # Why a dedicated thread
-//!
-//! libsignal's store traits are declared `#[async_trait(?Send)]`, so the futures
-//! that touch them are not `Send` and cannot be handed to `tokio::spawn` on
-//! Tauri's multi-threaded runtime. Rather than fight that, all messaging runs on
-//! one owned thread with a current-thread runtime, and the rest of the app talks
-//! to it over a channel. The `!Send` work never has to cross a thread boundary
-//! because it never leaves this one.
-//!
-//! Reading history is the exception: it goes through the `Arc<Vault>` directly
-//! from whichever thread asks, because it is a plain decrypt with no protocol
-//! state behind it.
-
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -33,25 +14,18 @@ use wisp_messaging::{
 
 use crate::relay_client::{HttpRelayClient, SessionCredentials};
 
-/// Event name for messages arriving while the app is open.
 pub const MESSAGE_EVENT: &str = "wisp://message";
-/// Event name for connection state changes.
 pub const CONNECTION_EVENT: &str = "wisp://connection";
-/// Event name for a group message arriving.
 pub const GROUP_MESSAGE_EVENT: &str = "wisp://group-message";
-/// Event name for learning about a group, or a member re-sharing their key.
 pub const GROUP_EVENT: &str = "wisp://group";
 
-/// How many one-time prekeys to publish per session.
 const PREKEY_BATCH: u32 = 20;
 const PREKEY_COUNTER_KEY: &[u8] = b"prekey_counter";
 const NS_META: &str = "meta";
 
-/// What the UI is told about a message.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageView {
-    /// Hex identity key of the other party.
     pub peer: String,
     pub outgoing: bool,
     pub sent_at: u64,
@@ -69,13 +43,11 @@ impl From<&Message> for MessageView {
     }
 }
 
-/// What the UI is told about a group.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupView {
     pub id: String,
     pub name: String,
-    /// Hex identity keys, ours included.
     pub members: Vec<String>,
     pub created_at: u64,
 }
@@ -91,8 +63,6 @@ impl From<&Group> for GroupView {
     }
 }
 
-/// A group message, with the sender named — unlike a one-to-one message, where
-/// the peer *is* the other party.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupMessageView {
@@ -140,19 +110,12 @@ struct Active {
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
-/// Tauri-managed messaging state. Empty until an identity is unlocked.
 #[derive(Default)]
 pub struct Messaging {
     active: Mutex<Option<Active>>,
 }
 
 impl Messaging {
-    /// Brings messaging up for a freshly unlocked identity.
-    ///
-    /// Failure here is deliberately **not** fatal to the unlock: if the relay is
-    /// unreachable the user should still get into the app and read the history
-    /// they already have, rather than being locked out by someone else's
-    /// downtime.
     pub fn start(
         &self,
         app: AppHandle,
@@ -166,8 +129,6 @@ impl Messaging {
         std::fs::create_dir_all(vault_dir).map_err(|e| format!("vault directory: {e}"))?;
         let vault_path = vault_dir.join(format!("{}.vault", hex(&public_key)));
 
-        // Keyed by the identity private key: without the drive, this file is
-        // noise.
         let vault = Arc::new(
             Vault::open(&vault_path, identity_private_key).map_err(|e| e.to_string())?,
         );
@@ -176,8 +137,6 @@ impl Messaging {
             identity_from_private_key(identity_private_key).map_err(|e| e.to_string())?;
         let registration_id = registration_id_from(&public_key);
 
-        // A second vault handle for the worker: the store needs ownership, the
-        // app needs history reads.
         let worker_vault =
             Vault::open(&vault_path, identity_private_key).map_err(|e| e.to_string())?;
         let messenger = Messenger::new(WispProtocolStore::new(
@@ -202,7 +161,6 @@ impl Messaging {
         Ok(())
     }
 
-    /// Tears messaging down. Safe to call when nothing is running.
     pub fn stop(&self) {
         let Some(mut active) = self.active.lock().unwrap().take() else {
             return;
@@ -217,7 +175,6 @@ impl Messaging {
         self.active.lock().unwrap().is_some()
     }
 
-    /// Every peer we have history with, newest conversation first.
     pub fn conversations(&self) -> Result<Vec<String>, String> {
         let guard = self.active.lock().unwrap();
         let Some(active) = guard.as_ref() else {
@@ -240,7 +197,6 @@ impl Messaging {
             .map_err(|e| e.to_string())
     }
 
-    /// Sends a message, returning it as stored.
     pub fn send(&self, recipient: [u8; 32], text: String) -> Result<MessageView, String> {
         let commands = {
             let guard = self.active.lock().unwrap();
@@ -260,15 +216,12 @@ impl Messaging {
             })
             .map_err(|_| "the messaging thread has stopped".to_string())?;
 
-        // Blocking is fine: Tauri runs commands on a pool, and the caller is a
-        // user waiting for their own message to send.
         wait.blocking_recv()
             .map_err(|_| "the messaging thread stopped before replying".to_string())?
     }
 }
 
 impl Messaging {
-    /// Every group we know about.
     pub fn groups(&self) -> Result<Vec<GroupView>, String> {
         let guard = self.active.lock().unwrap();
         let Some(active) = guard.as_ref() else {
@@ -291,7 +244,6 @@ impl Messaging {
             .map_err(|e| e.to_string())
     }
 
-    /// Creates a group and hands every member the key to read it.
     pub fn create_group(
         &self,
         name: String,
@@ -335,12 +287,8 @@ impl Drop for Messaging {
     }
 }
 
-/// libsignal wants a registration id per install; Wisp has one identity per
-/// device, so it is derived from the identity key rather than stored. Stable
-/// across restarts, which is what the protocol requires.
 fn registration_id_from(public_key: &[u8; 32]) -> u32 {
     let raw = u32::from_be_bytes([public_key[0], public_key[1], public_key[2], public_key[3]]);
-    // libsignal reserves the top bit.
     raw & 0x3FFF
 }
 
@@ -372,6 +320,15 @@ fn run_worker(
     });
 }
 
+const RECONNECT_MIN: std::time::Duration = std::time::Duration::from_secs(2);
+const RECONNECT_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+const OFFLINE: &str = "not connected to the relay";
+
+enum Ended {
+    Shutdown,
+    Dropped(String),
+}
+
 async fn worker_loop(
     app: &AppHandle,
     mut messenger: Messenger,
@@ -380,35 +337,117 @@ async fn worker_loop(
     vault: Arc<Vault>,
     mut commands: mpsc::UnboundedReceiver<Command>,
 ) -> Result<(), String> {
-    // Authenticate. The signature proves we hold the identity key.
-    let credentials: SessionCredentials = relay
-        .authenticate(&public_key, |message| {
-            messenger.sign(message).map_err(|e| e.to_string())
-        })
-        .map_err(|e| e.to_string())?;
+    let mut prekeys_published = false;
+    let mut delay = RECONNECT_MIN;
 
-    // Publish a fresh batch of prekeys so others can reach us while offline.
-    let base = next_prekey_base(&vault)?;
-    let published = messenger
-        .generate_prekeys(base, base, base + 1, PREKEY_BATCH)
-        .await
-        .map_err(|e| e.to_string())?;
-    relay
-        .publish_prekeys(&credentials.token, &published)
-        .map_err(|e| e.to_string())?;
+    loop {
+        let ended = run_connection(
+            app,
+            &mut messenger,
+            &relay,
+            public_key,
+            &vault,
+            &mut commands,
+            &mut prekeys_published,
+            &mut delay,
+        )
+        .await;
 
-    let (mut socket, _) = tokio_tungstenite::connect_async(relay.websocket_url())
-        .await
-        .map_err(|e| format!("could not open the relay socket: {e}"))?;
+        match ended {
+            Ended::Shutdown => break,
+            Ended::Dropped(reason) => {
+                report(app, false, &format!("{reason}; retrying in {}s", delay.as_secs()));
+            }
+        }
 
-    socket
+        if wait_to_retry(&mut commands, delay).await {
+            break;
+        }
+        delay = (delay * 2).min(RECONNECT_MAX);
+    }
+
+    report(app, false, "disconnected");
+    Ok(())
+}
+
+async fn wait_to_retry(
+    commands: &mut mpsc::UnboundedReceiver<Command>,
+    delay: std::time::Duration,
+) -> bool {
+    let sleep = tokio::time::sleep(delay);
+    tokio::pin!(sleep);
+
+    loop {
+        tokio::select! {
+            _ = &mut sleep => return false,
+            command = commands.recv() => match command {
+                Some(Command::Shutdown) | None => return true,
+                Some(Command::Send { reply, .. }) => {
+                    let _ = reply.send(Err(OFFLINE.to_string()));
+                }
+                Some(Command::CreateGroup { reply, .. }) => {
+                    let _ = reply.send(Err(OFFLINE.to_string()));
+                }
+                Some(Command::SendGroup { reply, .. }) => {
+                    let _ = reply.send(Err(OFFLINE.to_string()));
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_connection(
+    app: &AppHandle,
+    messenger: &mut Messenger,
+    relay: &HttpRelayClient,
+    public_key: [u8; 32],
+    vault: &Arc<Vault>,
+    commands: &mut mpsc::UnboundedReceiver<Command>,
+    prekeys_published: &mut bool,
+    delay: &mut std::time::Duration,
+) -> Ended {
+    let credentials: SessionCredentials = match relay.authenticate(&public_key, |message| {
+        messenger.sign(message).map_err(|e| e.to_string())
+    }) {
+        Ok(credentials) => credentials,
+        Err(e) => return Ended::Dropped(e.to_string()),
+    };
+
+    if !*prekeys_published {
+        let base = match next_prekey_base(vault) {
+            Ok(base) => base,
+            Err(e) => return Ended::Dropped(e),
+        };
+        let published = match messenger
+            .generate_prekeys(base, base, base + 1, PREKEY_BATCH)
+            .await
+        {
+            Ok(published) => published,
+            Err(e) => return Ended::Dropped(e.to_string()),
+        };
+        if let Err(e) = relay.publish_prekeys(&credentials.token, &published) {
+            return Ended::Dropped(e.to_string());
+        }
+        *prekeys_published = true;
+    }
+
+    let (mut socket, _) = match tokio_tungstenite::connect_async(relay.websocket_url()).await {
+        Ok(pair) => pair,
+        Err(e) => return Ended::Dropped(format!("could not open the relay socket: {e}")),
+    };
+
+    if let Err(e) = socket
         .send(WsMessage::Text(
             serde_json::json!({ "type": "auth", "token": credentials.token }).to_string(),
         ))
         .await
-        .map_err(|e| e.to_string())?;
+    {
+        return Ended::Dropped(e.to_string());
+    }
 
     report(app, true, "connected");
+    *delay = RECONNECT_MIN;
 
     loop {
         tokio::select! {
@@ -416,19 +455,17 @@ async fn worker_loop(
                 match incoming {
                     Some(Ok(WsMessage::Text(text))) => {
                         if let Err(e) = handle_frame(
-                            app, &mut messenger, &vault, &credentials, &text,
+                            app, messenger, vault, &credentials, &text,
                         ).await {
-                            // One bad message must not take the socket down;
-                            // a hostile relay could otherwise disconnect us at
-                            // will by sending garbage.
                             eprintln!("[wisp] dropped an unreadable message: {e}");
                         }
                     }
-                    Some(Ok(WsMessage::Close(_))) | None => break,
+                    Some(Ok(WsMessage::Close(_))) | None => {
+                        return Ended::Dropped("the relay closed the connection".to_string());
+                    }
                     Some(Ok(_)) => {}
                     Some(Err(e)) => {
-                        report(app, false, &format!("relay socket closed: {e}"));
-                        break;
+                        return Ended::Dropped(format!("relay socket closed: {e}"));
                     }
                 }
             }
@@ -437,36 +474,33 @@ async fn worker_loop(
                 match command {
                     Some(Command::Send { recipient, text, reply }) => {
                         let outcome = send_message(
-                            &mut messenger, &relay, &vault, &credentials,
+                            messenger, relay, vault, &credentials,
                             &mut socket, recipient, &text,
                         ).await;
                         let _ = reply.send(outcome);
                     }
                     Some(Command::CreateGroup { name, members, reply }) => {
                         let outcome = create_group(
-                            &mut messenger, &relay, &credentials, &mut socket, &name, members,
+                            messenger, relay, &credentials, &mut socket, &name, members,
                         ).await;
                         let _ = reply.send(outcome);
                     }
                     Some(Command::SendGroup { group, text, reply }) => {
                         let outcome = send_group_message(
-                            &mut messenger, &relay, &vault, &credentials,
+                            messenger, relay, vault, &credentials,
                             &mut socket, group, &text,
                         ).await;
                         let _ = reply.send(outcome);
                     }
-                    Some(Command::Shutdown) | None => break,
+                    Some(Command::Shutdown) | None => {
+                        let _ = socket.close(None).await;
+                        return Ended::Shutdown;
+                    }
                 }
             }
         }
     }
-
-    let _ = socket.close(None).await;
-    report(app, false, "disconnected");
-    Ok(())
 }
-
-/// Decrypts an inbound envelope and files it.
 async fn handle_frame(
     app: &AppHandle,
     messenger: &mut Messenger,
@@ -484,15 +518,11 @@ async fn handle_frame(
         .and_then(decode_base64)
         .ok_or("envelope was not valid base64")?;
 
-    // Sealed sender: who sent it is inside the ciphertext, and the certificate
-    // is validated against the trust root before we believe it.
     let (sender, plaintext) = messenger
         .unseal(&credentials.trust_root, &sealed)
         .await
         .map_err(|e| e.to_string())?;
 
-    // What kind of thing it is only becomes readable after decryption — the
-    // relay never sees this layer.
     match Content::from_bytes(&plaintext).map_err(|e| e.to_string())? {
         Content::Direct { body } => {
             let message = Message {
@@ -508,8 +538,6 @@ async fn handle_frame(
         }
 
         distribution @ Content::Distribution { .. } => {
-            // Someone has given us the key to read their group messages. This
-            // also teaches us the group if we had not heard of it.
             let group = messenger
                 .accept_distribution(&sender, &distribution)
                 .await
@@ -540,7 +568,6 @@ async fn handle_frame(
     Ok(())
 }
 
-/// Makes sure we can seal to `recipient`, fetching their prekeys if needed.
 async fn ensure_session(
     messenger: &mut Messenger,
     relay: &HttpRelayClient,
@@ -571,7 +598,6 @@ async fn ensure_session(
         .map_err(|e| e.to_string())
 }
 
-/// Seals one piece of content to one recipient and hands it to the relay.
 async fn deliver(
     messenger: &mut Messenger,
     relay: &HttpRelayClient,
@@ -604,11 +630,6 @@ async fn deliver(
         .map_err(|e| format!("could not reach the relay: {e}"))
 }
 
-/// Creates a group and distributes our sender key to every other member.
-///
-/// A member we cannot reach — no account, no prekeys — is reported rather than
-/// silently dropped, because they will never see anything sent to the group and
-/// the creator should know that now rather than wonder later.
 async fn create_group(
     messenger: &mut Messenger,
     relay: &HttpRelayClient,
@@ -645,8 +666,6 @@ async fn create_group(
     Ok(GroupView::from(&group))
 }
 
-/// Encrypts once for the group, then delivers that same ciphertext to each
-/// member.
 async fn send_group_message(
     messenger: &mut Messenger,
     relay: &HttpRelayClient,
@@ -678,8 +697,6 @@ async fn send_group_message(
         }
     }
 
-    // Recorded locally regardless: the message was written and encrypted, and
-    // hiding it because one member is unreachable would lose it.
     let message = GroupMessage {
         group: group_id,
         sender: me,
@@ -700,7 +717,6 @@ async fn send_group_message(
     Ok(GroupMessageView::from(&message))
 }
 
-/// Establishes a session if needed, seals, sends, and records.
 async fn send_message(
     messenger: &mut Messenger,
     relay: &HttpRelayClient,
@@ -712,7 +728,6 @@ async fn send_message(
 ) -> Result<MessageView, String> {
     let address = address_for(&recipient);
 
-    // First message to someone: fetch their bundle and run X3DH.
     if !messenger
         .has_session(&address)
         .await
@@ -737,8 +752,6 @@ async fn send_message(
         .seal(
             &address,
             &credentials.sender_certificate,
-            // Wrapped so the recipient can tell a message from a group
-            // distribution; before groups existed the plaintext was the text.
             &Content::Direct {
                 body: text.to_string(),
             }
@@ -776,8 +789,6 @@ type Socket = tokio_tungstenite::WebSocketStream<
     tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
 >;
 
-/// Prekey ids must never be reused, or a fresh key would overwrite one still in
-/// flight. The counter lives in the vault so it survives restarts.
 fn next_prekey_base(vault: &Vault) -> Result<u32, String> {
     let current = vault
         .get(NS_META, PREKEY_COUNTER_KEY)
@@ -833,7 +844,6 @@ fn decode_base64(text: &str) -> Option<Vec<u8>> {
     base64::engine::general_purpose::STANDARD.decode(text).ok()
 }
 
-/// Where per-identity vaults live.
 pub fn vault_dir(app: &AppHandle) -> PathBuf {
     use tauri::Manager;
     app.path()
@@ -866,7 +876,6 @@ mod tests {
         assert!(registration_id_from(&key) <= 0x3FFF);
     }
 
-    /// Reusing a prekey id would overwrite a key that may still be in flight.
     #[test]
     fn prekey_ids_never_repeat_across_sessions() {
         let vault = Vault::in_memory(b"secret").unwrap();

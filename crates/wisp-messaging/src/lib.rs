@@ -1,23 +1,5 @@
-//! Signal protocol integration for Wisp.
-//!
-//! Wraps libsignal so the rest of the app deals in "send this text to this
-//! public key" rather than in ratchets and prekey bundles. No cryptography is
-//! implemented here — every primitive comes from libsignal.
-//!
-//! # Where the keys live
-//!
-//! - The **identity key pair** comes from `identity.wisp` on the USB drive and
-//!   is passed in at construction. Pull the drive and it is gone.
-//! - **Session and prekey material** lives in a [`Vault`] on the host, encrypted
-//!   under a key derived from that identity key. Pull the drive and the vault
-//!   is inert.
-//!
-//! Nothing readable is left on the host by either.
-
 use std::time::SystemTime;
 
-// Re-exported so callers can name an address without taking a libsignal
-// dependency of their own — being the only crate that does is the point.
 pub use libsignal_protocol::ProtocolAddress;
 
 use libsignal_protocol::{
@@ -46,20 +28,12 @@ pub use store::{identity_from_private_key, WispProtocolStore};
 pub use vault::Vault;
 pub use wire::WireEnvelope;
 
-/// The protocol address for an identity key.
-///
-/// libsignal addresses are `(name, device)`; Wisp uses the identity key's hex
-/// as the name so the address is derived from the key and cannot disagree with
-/// it. One canonical spelling, everywhere.
 pub fn address_for(identity: &[u8; 32]) -> ProtocolAddress {
     ProtocolAddress::new(sealed::identity_string(identity), device_id())
 }
 
-/// Wisp is desktop-only and one identity means one device, so the device id is
-/// a constant. Groups and multi-device would make this meaningful.
 pub const DEVICE_ID: u8 = 1;
 
-/// The public material a client publishes so others can start a session with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishedPreKeys {
     pub registration_id: u32,
@@ -70,23 +44,15 @@ pub struct PublishedPreKeys {
     pub kyber_prekey_id: u32,
     pub kyber_prekey_public: Vec<u8>,
     pub kyber_prekey_signature: Vec<u8>,
-    /// `(id, public key)` pairs, each usable once.
     pub one_time_prekeys: Vec<(u32, Vec<u8>)>,
 }
 
-/// A message on the wire: the ciphertext plus which kind it is.
-///
-/// The type tag matters because the first message of a session is a
-/// `PreKeySignalMessage` — it carries the material the recipient needs to build
-/// their side of the session — and every message after it is a plain
-/// `SignalMessage`. The recipient cannot tell them apart from the bytes alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Envelope {
     pub is_prekey: bool,
     pub ciphertext: Vec<u8>,
 }
 
-/// The Signal protocol, wrapped.
 pub struct Messenger {
     pub(crate) store: WispProtocolStore,
 }
@@ -104,11 +70,6 @@ impl Messenger {
         self.store.identity_key_pair()
     }
 
-    /// Signs with the identity key, for authenticating to the relay.
-    ///
-    /// Exposed here so callers never have to reach for libsignal themselves —
-    /// this crate staying the only one that does is what keeps the signature
-    /// format in one place.
     pub fn sign(&self, message: &[u8]) -> MessagingResult<[u8; 64]> {
         let mut rng = rand::rngs::OsRng.unwrap_err();
         let signature = self
@@ -122,12 +83,6 @@ impl Messenger {
             .map_err(|_| MessagingError::Malformed)
     }
 
-    /// Generates and stores fresh prekeys, returning the public half to publish.
-    ///
-    /// The private halves go straight into the vault; only public keys and
-    /// signatures are returned. Both the signed and kyber prekeys are signed by
-    /// the identity key, which is what lets a recipient know the relay did not
-    /// substitute its own.
     pub async fn generate_prekeys(
         &mut self,
         signed_prekey_id: u32,
@@ -141,7 +96,6 @@ impl Messenger {
         let identity = *self.store.identity_key_pair();
         let now = Timestamp::from_epoch_millis(now_millis());
 
-        // Signed prekey.
         let signed_pair = KeyPair::generate(&mut rng);
         let signed_signature = identity
             .private_key()
@@ -158,7 +112,6 @@ impl Messenger {
             .save_signed_pre_key(signed_prekey_id.into(), &signed_record)
             .await?;
 
-        // Post-quantum prekey.
         let kyber_record = KyberPreKeyRecord::generate(
             libsignal_protocol::kem::KeyType::Kyber1024,
             kyber_prekey_id.into(),
@@ -169,7 +122,6 @@ impl Messenger {
             .save_kyber_pre_key(kyber_prekey_id.into(), &kyber_record)
             .await?;
 
-        // One-time prekeys.
         let mut one_time_prekeys = Vec::with_capacity(one_time_count as usize);
         for offset in 0..one_time_count {
             let id = one_time_start_id + offset;
@@ -195,11 +147,6 @@ impl Messenger {
         })
     }
 
-    /// Establishes a session from someone else's published prekeys (X3DH).
-    ///
-    /// libsignal verifies the bundle's signatures against the claimed identity
-    /// key here; a relay that tampered with the prekeys fails this step rather
-    /// than silently getting a session it can read.
     pub async fn start_session(
         &mut self,
         remote: &ProtocolAddress,
@@ -224,7 +171,6 @@ impl Messenger {
         Ok(self.store.session_store.load_session(remote).await?.is_some())
     }
 
-    /// Encrypts for an established session, advancing the ratchet.
     pub async fn encrypt(
         &mut self,
         remote: &ProtocolAddress,
@@ -252,8 +198,6 @@ impl Messenger {
         })
     }
 
-    /// Decrypts an incoming envelope, creating the session if this is the first
-    /// message of one.
     pub async fn decrypt(
         &mut self,
         remote: &ProtocolAddress,
@@ -288,10 +232,6 @@ impl Messenger {
 
     // --- Groups ------------------------------------------------------------
 
-    /// Creates a group and its sender key.
-    ///
-    /// `members` should include everyone, us included; a group we are not in is
-    /// one we could not read.
     pub fn create_group(
         &mut self,
         name: &str,
@@ -315,7 +255,6 @@ impl Messenger {
         Ok(created)
     }
 
-    /// Our own identity key.
     pub fn public_key(&self) -> MessagingResult<[u8; 32]> {
         self.identity_key_pair()
             .public_key()
@@ -332,10 +271,6 @@ impl Messenger {
         group::Groups::new(&self.store.vault).get(id)
     }
 
-    /// Builds the message that lets other members read what we send.
-    ///
-    /// Creates our sender key for the group if it does not exist yet, so
-    /// calling this is what makes us able to send at all.
     pub async fn sender_key_distribution(
         &mut self,
         group: &group::Group,
@@ -358,11 +293,6 @@ impl Messenger {
         })
     }
 
-    /// Accepts someone else's sender key, learning the group if it is new.
-    ///
-    /// The group is stored as the *sender* describes it. There is no server to
-    /// arbitrate membership, so a member's view of a group is whatever the
-    /// people in it last told them — worth knowing when reading the member list.
     pub async fn accept_distribution(
         &mut self,
         sender: &[u8; 32],
@@ -393,8 +323,6 @@ impl Messenger {
             id: *id,
             name: name.clone(),
             members: members.clone(),
-            // Keep the original creation time if we already knew this group, so
-            // the list does not reorder every time someone re-shares a key.
             created_at: groups
                 .get(id)?
                 .map(|existing| existing.created_at)
@@ -404,19 +332,11 @@ impl Messenger {
         Ok(record)
     }
 
-    /// Encrypts once for the whole group.
-    ///
-    /// The result is wrapped per recipient by the caller; this is the part that
-    /// happens a single time no matter how many members there are.
     pub async fn encrypt_group(
         &mut self,
         group: &group::Group,
         plaintext: &[u8],
     ) -> MessagingResult<Content> {
-        // Our sender key is created by building a distribution message, so
-        // encrypting before ever distributing would otherwise fail with
-        // `NoSenderKeyState`. Ensuring it here removes an ordering dependency
-        // that is invisible at the call site and easy to get wrong.
         self.ensure_sender_key(group).await?;
 
         let mut rng = rand::rngs::OsRng.unwrap_err();
@@ -436,11 +356,6 @@ impl Messenger {
         })
     }
 
-    /// Creates our sender key for a group if we do not have one yet.
-    ///
-    /// `create_sender_key_distribution_message` loads an existing record and
-    /// only mints one when absent, so this is safe to call before every send —
-    /// it will not rotate a key other members already hold.
     async fn ensure_sender_key(&mut self, group: &group::Group) -> MessagingResult<()> {
         use libsignal_protocol::SenderKeyStore;
 
@@ -464,11 +379,6 @@ impl Messenger {
         Ok(())
     }
 
-    /// Decrypts a group message using the sender's key.
-    ///
-    /// Fails when we have no sender key from them — which is the normal state
-    /// before their distribution message has arrived, not an error worth
-    /// alarming the user about.
     pub async fn decrypt_group(
         &mut self,
         sender: &[u8; 32],
@@ -482,27 +392,14 @@ impl Messenger {
         .await?)
     }
 
-    /// Our own address, spelled the same way everyone else spells it.
-    ///
-    /// This used to be the literal `"self"`, which worked for one-to-one but is
-    /// wrong for groups: a sender key is filed under the *sender's* address, so
-    /// our own record would have been keyed differently from how every other
-    /// member keys it. Deriving it from the identity keeps one spelling
-    /// everywhere.
     fn local_address(&self) -> ProtocolAddress {
         match self.public_key() {
             Ok(key) => address_for(&key),
-            // Unreachable with a valid identity, and a stable fallback is
-            // better than a panic in the middle of sending.
             Err(_) => ProtocolAddress::new("self".to_string(), device_id()),
         }
     }
 }
 
-/// The single device id every Wisp identity uses.
-///
-/// Infallible in practice — `DEVICE_ID` is a valid constant — so this cannot
-/// fire.
 pub fn device_id() -> DeviceId {
     DeviceId::new(DEVICE_ID).expect("DEVICE_ID is a valid device id")
 }
@@ -514,7 +411,6 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-/// Builds a libsignal [`PreKeyBundle`] from published material.
 pub fn bundle_from_published(
     published: &PublishedPreKeys,
     one_time: Option<(u32, &[u8])>,
@@ -557,8 +453,6 @@ mod tests {
     fn messenger(registration_id: u32) -> Messenger {
         let mut rng = rand::rngs::OsRng.unwrap_err();
         let identity = IdentityKeyPair::generate(&mut rng);
-        // The vault key is derived from the identity's private key, exactly as
-        // it will be in the app.
         let vault = Vault::in_memory(&identity.private_key().serialize()).unwrap();
         Messenger::new(WispProtocolStore::new(vault, identity, registration_id))
     }
@@ -567,14 +461,11 @@ mod tests {
         ProtocolAddress::new(name.to_string(), device_id())
     }
 
-    /// The headline test: two parties who have never spoken establish a session
-    /// from a prekey bundle and exchange messages.
     #[tokio::test]
     async fn two_parties_can_hold_a_conversation() {
         let mut alice = messenger(1001);
         let mut bob = messenger(2002);
 
-        // Bob publishes prekeys; Alice fetches them and starts a session.
         let published = bob.generate_prekeys(1, 1, 100, 5).await.unwrap();
         let one_time = published.one_time_prekeys[0].clone();
         let bundle = bundle_from_published(&published, Some((one_time.0, &one_time.1))).unwrap();
@@ -582,14 +473,12 @@ mod tests {
         alice.start_session(&address("bob"), &bundle).await.unwrap();
         assert!(alice.has_session(&address("bob")).await.unwrap());
 
-        // Alice's first message carries the session setup.
         let first = alice.encrypt(&address("bob"), b"hello bob").await.unwrap();
         assert!(first.is_prekey, "the opening message must set up the session");
 
         let received = bob.decrypt(&address("alice"), &first).await.unwrap();
         assert_eq!(received, b"hello bob");
 
-        // Bob can now reply, and his reply is an ordinary ratchet message.
         let reply = bob.encrypt(&address("alice"), b"hello alice").await.unwrap();
         assert!(!reply.is_prekey);
         assert_eq!(
@@ -598,8 +487,6 @@ mod tests {
         );
     }
 
-    /// Forward secrecy in the visible sense: each message gets a different
-    /// ciphertext even when the plaintext repeats.
     #[tokio::test]
     async fn repeated_plaintexts_produce_different_ciphertexts() {
         let mut alice = messenger(1001);
@@ -614,7 +501,6 @@ mod tests {
         let b = alice.encrypt(&address("bob"), b"same text").await.unwrap();
         assert_ne!(a.ciphertext, b.ciphertext, "the ratchet must advance");
 
-        // Both still decrypt, and out of order at that.
         assert_eq!(bob.decrypt(&address("alice"), &b).await.unwrap(), b"same text");
         assert_eq!(bob.decrypt(&address("alice"), &a).await.unwrap(), b"same text");
     }
@@ -628,8 +514,6 @@ mod tests {
         ));
     }
 
-    /// A session can be built without a one-time prekey, which is what happens
-    /// when the recipient's pool is exhausted.
     #[tokio::test]
     async fn a_session_works_without_a_one_time_prekey() {
         let mut alice = messenger(1001);
@@ -648,8 +532,6 @@ mod tests {
         );
     }
 
-    /// A tampered ciphertext must not decrypt — the AEAD, not a checksum, is
-    /// what makes this true.
     #[tokio::test]
     async fn a_tampered_message_is_rejected() {
         let mut alice = messenger(1001);
@@ -667,8 +549,6 @@ mod tests {
         assert!(bob.decrypt(&address("alice"), &message).await.is_err());
     }
 
-    /// A one-time prekey is consumed on use, so a replayed opening message
-    /// cannot re-derive the same initial state.
     #[tokio::test]
     async fn a_one_time_prekey_is_consumed_on_first_use() {
         use libsignal_protocol::PreKeyStore;
@@ -695,8 +575,6 @@ mod tests {
         );
     }
 
-    /// Prekey generation must not leak private material into what gets
-    /// published.
     #[tokio::test]
     async fn published_prekeys_contain_no_private_keys() {
         let mut bob = messenger(2002);
@@ -743,8 +621,6 @@ mod tests {
         let bundle = bundle_from_published(&published, Some((one_time.0, &one_time.1))).unwrap();
         alice.start_session(&address("bob"), &bundle).await.unwrap();
 
-        // Every load goes through the encrypted vault, so this exercises the
-        // serialise/encrypt/decrypt/deserialise round trip.
         assert!(alice.has_session(&address("bob")).await.unwrap());
         let message = alice.encrypt(&address("bob"), b"round trip").await.unwrap();
         assert_eq!(
@@ -759,21 +635,6 @@ mod tests {
         m.public_key().unwrap()
     }
 
-    /// Gives `to` a live one-to-one session with `from`, which group setup
-    /// needs: the distribution message travels over it.
-    async fn link(from: &mut Messenger, to: &mut Messenger, prekey_base: u32) {
-        let published = to
-            .generate_prekeys(prekey_base, prekey_base, prekey_base + 1, 5)
-            .await
-            .unwrap();
-        let one_time = published.one_time_prekeys[0].clone();
-        let bundle = bundle_from_published(&published, Some((one_time.0, &one_time.1))).unwrap();
-        from.start_session(&address_for(&identity_of(to)), &bundle)
-            .await
-            .unwrap();
-    }
-
-    /// The headline test: one encryption, three readers.
     #[tokio::test]
     async fn a_group_message_reaches_every_member() {
         let mut alice = messenger(1001);
@@ -788,13 +649,11 @@ mod tests {
         let group = alice.create_group("the group", members).unwrap();
         assert_eq!(group.members.len(), 3);
 
-        // Alice hands out her sender key.
         let distribution = alice.sender_key_distribution(&group).await.unwrap();
         let alice_id = identity_of(&alice);
         bob.accept_distribution(&alice_id, &distribution).await.unwrap();
         carol.accept_distribution(&alice_id, &distribution).await.unwrap();
 
-        // One encryption for the whole group.
         let content = alice
             .encrypt_group(&group, b"meeting at six")
             .await
@@ -803,7 +662,6 @@ mod tests {
             panic!("expected a group message, got {content:?}");
         };
 
-        // Both members read the same bytes.
         assert_eq!(
             bob.decrypt_group(&alice_id, ciphertext).await.unwrap(),
             b"meeting at six"
@@ -814,7 +672,6 @@ mod tests {
         );
     }
 
-    /// Receiving a distribution is how a member learns the group exists.
     #[tokio::test]
     async fn accepting_a_distribution_creates_the_group_locally() {
         let mut alice = messenger(1001);
@@ -837,8 +694,6 @@ mod tests {
         assert!(known[0].contains(&identity_of(&alice)));
     }
 
-    /// Without the sender key there is nothing to read with — the expected
-    /// state before a distribution arrives, not a crash.
     #[tokio::test]
     async fn a_member_without_the_sender_key_cannot_read() {
         let mut alice = messenger(1001);
@@ -858,7 +713,6 @@ mod tests {
             .is_err());
     }
 
-    /// Two members sending in the same group each use their own sender key.
     #[tokio::test]
     async fn both_directions_work_in_a_group() {
         let mut alice = messenger(1001);
@@ -869,11 +723,9 @@ mod tests {
         let alice_id = identity_of(&alice);
         let bob_id = identity_of(&bob);
 
-        // Alice -> Bob
         let from_alice = alice.sender_key_distribution(&group).await.unwrap();
         bob.accept_distribution(&alice_id, &from_alice).await.unwrap();
 
-        // Bob -> Alice. Bob already knows the group, so he can hand out his own.
         let bob_group = bob.group(&group.id).unwrap().unwrap();
         let from_bob = bob.sender_key_distribution(&bob_group).await.unwrap();
         alice.accept_distribution(&bob_id, &from_bob).await.unwrap();
@@ -890,7 +742,6 @@ mod tests {
         assert_eq!(alice.decrypt_group(&bob_id, cb).await.unwrap(), b"from bob");
     }
 
-    /// Successive messages must not produce the same ciphertext.
     #[tokio::test]
     async fn the_group_ratchet_advances() {
         let mut alice = messenger(1001);
@@ -913,7 +764,6 @@ mod tests {
         else {
             unreachable!()
         };
-        // Out of order, as the relay may well deliver them.
         assert_eq!(bob.decrypt_group(&identity_of(&alice), c2).await.unwrap(), b"same");
         assert_eq!(bob.decrypt_group(&identity_of(&alice), c1).await.unwrap(), b"same");
     }
@@ -944,7 +794,6 @@ mod tests {
             .is_err());
     }
 
-    /// The creator is always a member, even if they leave themselves out.
     #[tokio::test]
     async fn the_creator_is_always_a_member() {
         let mut alice = messenger(1001);
@@ -963,7 +812,6 @@ mod tests {
         assert_eq!(group.members.len(), 2);
     }
 
-    /// Fan-out addresses everyone but us.
     #[tokio::test]
     async fn fan_out_excludes_the_sender() {
         let mut alice = messenger(1001);

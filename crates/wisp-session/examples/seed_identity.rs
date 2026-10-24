@@ -1,17 +1,3 @@
-//! Writes an identity onto a development fake drive, for looking at the
-//! unlocked screens.
-//!
-//! ```text
-//! cargo run -p wisp-session --example seed_identity -- <dir> <username> <passphrase>
-//! ```
-//!
-//! Creates the identity locally and writes it to `<dir>/.wisp/identity.wisp`.
-//! It does **not** register with the relay, so the app will unlock and then
-//! report itself offline — which is enough to inspect every unlocked screen,
-//! and avoids spending a real invite code to look at a layout.
-//!
-//! Pair it with `WISP_FAKE_DRIVE=<dir>` when launching the app.
-
 use std::path::PathBuf;
 
 use wisp_core::crypto::KdfParams;
@@ -44,10 +30,7 @@ fn main() {
         &identity,
         passphrase,
         &volume.identifiers,
-        // Never machine-bound: the point is to be able to open it.
         None,
-        // Real cost. Seeding is a one-off and matching production means the
-        // unlock this produces feels like the real thing.
         KdfParams::RECOMMENDED,
     )
     .expect("sealing the identity");
@@ -75,14 +58,6 @@ fn main() {
     println!("launch with: WISP_FAKE_DRIVE={dir}");
 }
 
-/// Must match `fake_serial` in `src-tauri/src/dev_drive.rs`, or the app will
-/// compute a different drive identity and refuse what this wrote.
-///
-/// Stable across the different spellings of the same directory.
-///
-/// Derived from the *canonical* path: `C:/x` and `C:\x` are the same folder
-/// but different strings, and hashing the raw string made the app and the
-/// seeding tool disagree about which drive this was.
 fn fake_serial(path: &std::path::Path) -> String {
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     format!(

@@ -1,6 +1,6 @@
 [package]
 name = "wisp-admin"
-description = "Owner-side CLI for issuing and managing Wisp invite codes."
+description = "Operator-side CLI for moderating Wisp relay accounts."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,4 +9,3 @@ publish.workspace = true
 
 [dependencies]
 wisp-server = { path = "../wisp-server" }
-wisp-invite = { path = "../wisp-invite" }

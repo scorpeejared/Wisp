@@ -20,9 +20,6 @@ argon2 = "0.5"
 chacha20poly1305 = "0.10"
 bip39 = "2.1"
 
-# The identity key *is* the Signal identity key — one key, not an account key
-# plus a messaging key. That makes libsignal a dependency of the identity
-# format itself, and means building this crate needs `protoc` on PATH.
 libsignal-protocol = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.4" }
 rand = "0.9"
 

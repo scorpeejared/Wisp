@@ -1,16 +1,9 @@
-//! HTTP transport for the relay.
-//!
-//! Lives here rather than in `wisp-session` so the access gate stays free of
-//! networking code and can be tested without a server.
-
 use wisp_session::{RegistrationRequest, RelayClient, RelayError};
 
-/// Where the relay lives when nothing else is configured.
-///
-/// A local default rather than a hosted one on purpose: a misconfigured build
-/// should fail to connect, never quietly register a user against somebody
-/// else's server.
-const DEFAULT_RELAY_URL: &str = "http://127.0.0.1:8080";
+const DEFAULT_RELAY_URL: &str = match option_env!("WISP_DEFAULT_RELAY_URL") {
+    Some(url) => url,
+    None => "http://127.0.0.1:8080",
+};
 
 const TIMEOUT_SECS: u64 = 20;
 
@@ -32,7 +25,6 @@ impl HttpRelayClient {
     }
 }
 
-/// What a client needs before it can send anything.
 pub struct SessionCredentials {
     pub token: String,
     pub sender_certificate: Vec<u8>,
@@ -40,11 +32,6 @@ pub struct SessionCredentials {
 }
 
 impl HttpRelayClient {
-    /// The relay's WebSocket URL, derived from the HTTP one.
-    ///
-    /// Derived rather than configured separately so the two can never point at
-    /// different servers — a mismatch would authenticate against one relay and
-    /// deliver through another.
     pub fn websocket_url(&self) -> String {
         let base = self
             .base_url
@@ -96,8 +83,6 @@ impl HttpRelayClient {
         }
     }
 
-    /// Completes the challenge/response handshake and fetches the sealed-sender
-    /// material, so a caller gets everything needed to send in one step.
     pub fn authenticate(
         &self,
         public_key: &[u8; 32],
@@ -150,7 +135,6 @@ impl HttpRelayClient {
         })
     }
 
-    /// Publishes our prekeys so others can start sessions while we are offline.
     pub fn publish_prekeys(
         &self,
         token: &str,
@@ -178,7 +162,6 @@ impl HttpRelayClient {
         Ok(())
     }
 
-    /// Fetches someone's bundle, consuming one of their one-time prekeys.
     pub fn fetch_prekeys(
         &self,
         token: &str,
@@ -211,7 +194,6 @@ impl HttpRelayClient {
             one_time_prekeys: Vec::new(),
         };
 
-        // Absent when the pool is exhausted; X3DH proceeds without it.
         let one_time = body["one_time_prekey"].as_object().and_then(|prekey| {
             Some((
                 prekey["id"].as_u64()? as u32,
@@ -255,8 +237,6 @@ impl RelayClient for HttpRelayClient {
         match response {
             Ok(_) => Ok(()),
 
-            // The relay answered and said no. Surface its message — it is
-            // already the sanitised, client-safe one.
             Err(ureq::Error::Status(_, response)) => Err(RelayError::rejected(
                 response
                     .into_json::<serde_json::Value>()
@@ -265,8 +245,6 @@ impl RelayClient for HttpRelayClient {
                     .unwrap_or_else(|| "the relay rejected the registration".to_string()),
             )),
 
-            // Never reached the relay, so the invite code is almost certainly
-            // still unspent and the user can retry with it.
             Err(ureq::Error::Transport(transport)) => Err(RelayError::unreachable(format!(
                 "could not reach the relay: {transport}"
             ))),
@@ -280,7 +258,6 @@ mod tests {
 
     #[test]
     fn trailing_slashes_are_trimmed() {
-        // Otherwise the request URL would contain a double slash.
         std::env::set_var("WISP_RELAY_URL", "https://relay.example.com/");
         assert_eq!(
             HttpRelayClient::from_env().base_url(),
@@ -295,17 +272,13 @@ mod tests {
         assert_eq!(HttpRelayClient::from_env().base_url(), DEFAULT_RELAY_URL);
     }
 
-    /// An unreachable relay must be reported as retryable, so the caller keeps
-    /// the invite code rather than discarding it as spent.
     #[test]
     fn an_unreachable_relay_is_reported_as_retryable() {
         let client = HttpRelayClient {
-            // Reserved by RFC 5737 for documentation; never routable.
             base_url: "http://192.0.2.1:1".to_string(),
         };
         let error = client
             .register(&RegistrationRequest {
-                invite_code: "WISP-A1B2-C3D4-E5F6-G7H8".into(),
                 username: "alice".into(),
                 public_key: [0u8; 32],
                 signature: [0u8; 64],

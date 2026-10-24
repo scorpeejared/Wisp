@@ -1,0 +1,13 @@
+services:
+  relay:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - wisp-data:/data
+    environment:
+      WISP_SIGNUPS_PER_ADDRESS: "100"
+    restart: unless-stopped
+
+volumes:
+  wisp-data:

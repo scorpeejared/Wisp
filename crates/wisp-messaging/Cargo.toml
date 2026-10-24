@@ -10,22 +10,14 @@ publish.workspace = true
 [dependencies]
 wisp-core = { path = "../wisp-core" }
 
-# Signal's Rust crates are not published to crates.io, so this is pinned to a
-# release tag rather than a version. Bumping it is a deliberate act: the tag is
-# the only thing standing between us and an unreviewed protocol change.
-#
-# Building it requires `protoc` on PATH.
 libsignal-protocol = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.4" }
 
 thiserror.workspace = true
 sha2.workspace = true
 hkdf.workspace = true
-zeroize.workspace = true
 chacha20poly1305 = "0.10"
 rusqlite = { version = "0.32", features = ["bundled"] }
 async-trait = "0.1"
-# libsignal's API takes `rand` 0.9 RNGs; wisp-core is on rand_core 0.6 via
-# ed25519-dalek. The two coexist without interacting.
 rand = "0.9"
 uuid = { version = "1", features = ["v4"] }
 

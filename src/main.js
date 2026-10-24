@@ -1,11 +1,3 @@
-// Wisp renderer.
-//
-// This file holds no security logic and makes no decisions. It renders whatever
-// Status the Rust side reports and forwards user input back. Anything that
-// looks like a rule here — which screen to show, whether a passphrase is strong
-// enough — is a rule enforced in Rust and merely reflected here, so that a
-// tampered renderer cannot grant itself anything.
-
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
@@ -18,7 +10,6 @@ const screens = new Map(
 
 const field = (name) => document.querySelector(`[data-field="${name}"]`);
 
-/** Shows exactly one screen and hides the rest. */
 function show(name) {
   for (const [key, el] of screens) el.hidden = key !== name;
 }
@@ -35,15 +26,16 @@ function setError(name, message) {
   el.hidden = !message;
 }
 
-/**
- * Renders a Status from Rust.
- *
- * The `state` tag is the only thing that decides what is on screen. There is no
- * client-side path to the unlocked view.
- */
 function render(status) {
   currentState = status.state;
   resetIdleTimer();
+
+  if (status.state !== "registrable") clearPhrase();
+
+  if (pickerOpen && status.state !== "unlocked") {
+    refreshDrives();
+    return;
+  }
 
   switch (status.state) {
     case "noDevice":
@@ -57,7 +49,6 @@ function render(status) {
       break;
 
     case "denied":
-      // Nothing is populated here on purpose.
       show("denied");
       break;
 
@@ -75,7 +66,6 @@ function render(status) {
     case "idle":
       setText("idleUsername", status.username);
       setError("resumeError", null);
-      // Only offered where the hardware exists; the passphrase is always there.
       document.querySelector('[data-action="hello"]').hidden =
         !status.biometricsAvailable;
       show("idle");
@@ -89,6 +79,7 @@ function render(status) {
       setError("registerError", null);
       show("registrable");
       focusFirstInput("registrable");
+      if (!generatedPhrase) newPhrase();
       break;
 
     case "unlocked":
@@ -99,8 +90,6 @@ function render(status) {
       renderTrustedComputer(status);
       renderAbout(status);
       show("unlocked");
-      // Always land on Messages: the drive may have been pulled and
-      // reinserted, and a stale open conversation would be misleading.
       openList();
       refreshConversations();
       break;
@@ -118,7 +107,6 @@ function driveLabel(status) {
 
 function focusFirstInput(screen) {
   const input = screens.get(screen)?.querySelector("input");
-  // Deferred so focus lands after the screen is actually visible.
   if (input) requestAnimationFrame(() => input.focus());
 }
 
@@ -135,8 +123,6 @@ document
     } catch (error) {
       setError("unlockError", String(error));
     } finally {
-      // Clear the field either way, so a wrong passphrase is not left sitting
-      // on screen and a correct one is not left in the DOM.
       input.value = "";
     }
   });
@@ -144,106 +130,50 @@ document
 // --- Registration -----------------------------------------------------------
 
 const registerForm = document.querySelector('[data-form="register"]');
-const registerPassphrase = registerForm.elements.passphrase;
-const registerInvite = registerForm.elements.inviteCode;
 
-// Format-checked in Rust by the same parser the relay uses, so the feedback
-// here can never disagree with the answer the server would give. This catches
-// typos without spending one of the relay's rate-limited redemption attempts.
-let inviteTimer = null;
-registerInvite.addEventListener("input", () => {
-  clearTimeout(inviteTimer);
-  inviteTimer = setTimeout(async () => {
-    const value = registerInvite.value.trim();
-    if (!value) {
-      setText("inviteState", "Ask the person who invited you. Each code works once.");
-      return;
-    }
-    const valid = await invoke("check_invite_code", { candidate: value });
-    setText(
-      "inviteState",
-      valid ? "Code looks valid." : "That doesn't look like a complete code yet.",
-    );
-  }, 150);
-});
+let generatedPhrase = "";
 
-// Strength is scored in Rust by the same code that enforces the policy at
-// creation, so the meter can never disagree with the outcome.
-let assessTimer = null;
-registerPassphrase.addEventListener("input", () => {
-  clearTimeout(assessTimer);
-  assessTimer = setTimeout(async () => {
-    const value = registerPassphrase.value;
-    if (!value) {
-      updateMeter(null);
-      return;
-    }
-    updateMeter(await invoke("assess_passphrase", { candidate: value }));
-  }, 120);
-});
+function clearPhrase() {
+  generatedPhrase = "";
+  setText("generatedPhrase", "…");
+  registerForm.elements.saved.checked = false;
+}
 
-function updateMeter(report) {
-  const fill = field("meterFill");
-
-  if (!report) {
-    fill.style.width = "0";
-    setText(
-      "strength",
-      "Minimum 12 characters and 60 bits of estimated entropy.",
-    );
-    return;
+async function newPhrase() {
+  try {
+    generatedPhrase = await invoke("generate_passphrase");
+    setText("generatedPhrase", generatedPhrase);
+    registerForm.elements.saved.checked = false;
+  } catch (error) {
+    setError("registerError", String(error));
   }
-
-  // 100 bits is treated as a full bar; the policy floor is 60.
-  const ratio = Math.min(report.estimatedBits / 100, 1);
-  fill.style.width = `${ratio * 100}%`;
-  fill.style.backgroundColor = report.acceptable
-    ? "var(--accent)"
-    : "var(--deny)";
-
-  const kind = report.isWordPhrase ? "word phrase" : "passphrase";
-  setText(
-    "strength",
-    report.acceptable
-      ? `${report.estimatedBits} bits — strong ${kind}.`
-      : report.problem,
-  );
 }
 
 registerForm
   .querySelector('[data-action="generate"]')
-  .addEventListener("click", async () => {
-    const phrase = await invoke("generate_passphrase");
-    registerPassphrase.value = phrase;
-    registerPassphrase.type = "text";
-    setText("generatedPhrase", phrase);
-    field("generated").hidden = false;
-    updateMeter(await invoke("assess_passphrase", { candidate: phrase }));
-  });
+  .addEventListener("click", newPhrase);
 
 registerForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  const { inviteCode, username, passphrase } = event.target.elements;
+  const { username } = event.target.elements;
   const submit = registerForm.querySelector('button[type="submit"]');
 
-  // Registration talks to the relay, so it is the one action here that can
-  // take a noticeable moment. Disable the button rather than let an impatient
-  // double-click send two redemptions for the same code.
+  if (!generatedPhrase) {
+    setError("registerError", "Your passphrase is not ready yet — try again.");
+    return;
+  }
+
   submit.disabled = true;
   submit.textContent = "Creating identity…";
 
   try {
     render(
       await invoke("register", {
-        inviteCode: inviteCode.value.trim(),
         username: username.value.trim(),
-        passphrase: passphrase.value,
+        passphrase: generatedPhrase,
       }),
     );
-    passphrase.value = "";
-    inviteCode.value = "";
-    field("generated").hidden = true;
-    setText("generatedPhrase", "");
+    username.value = "";
   } catch (error) {
     setError("registerError", String(error));
   } finally {
@@ -251,6 +181,92 @@ registerForm.addEventListener("submit", async (event) => {
     submit.textContent = "Create identity";
   }
 });
+// --- Drives -----------------------------------------------------------------
+
+let pickerOpen = false;
+
+async function openDrives() {
+  pickerOpen = true;
+  setError("driveError", null);
+  show("drives");
+  await refreshDrives();
+}
+
+async function refreshDrives() {
+  const list = field("driveList");
+  if (!list) return;
+
+  let drives = [];
+  try {
+    drives = await invoke("list_drives");
+  } catch (error) {
+    setError("driveError", String(error));
+  }
+
+  list.replaceChildren();
+
+  if (drives.length === 0) {
+    const empty = document.createElement("li");
+    empty.className = "muted small";
+    empty.textContent = "No drive found. Insert one.";
+    list.append(empty);
+    return;
+  }
+
+  for (const drive of drives) {
+    const item = document.createElement("li");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = drive.current ? "drive current" : "drive";
+
+    const title = document.createElement("span");
+    title.textContent = drive.label
+      ? `${drive.label} (${drive.mountPoint})`
+      : drive.mountPoint;
+
+    const detail = document.createElement("span");
+    detail.className = "detail";
+    detail.textContent =
+      (drive.hasIdentity
+        ? "Holds an identity"
+        : "Blank — set up a new identity") + (drive.current ? " · in use" : "");
+
+    button.append(title, detail);
+    button.addEventListener("click", () => selectDrive(drive.mountPoint));
+    item.append(button);
+    list.append(item);
+  }
+}
+
+async function selectDrive(mountPoint) {
+  try {
+    const status = await invoke("select_drive", { mountPoint });
+    pickerOpen = false;
+    render(status);
+  } catch (error) {
+    setError("driveError", String(error));
+  }
+}
+
+for (const button of document.querySelectorAll('[data-action="chooseDrive"]')) {
+  button.addEventListener("click", openDrives);
+}
+
+document
+  .querySelector('[data-action="closeDrives"]')
+  .addEventListener("click", async () => {
+    pickerOpen = false;
+    render(await invoke("gate_status"));
+  });
+
+document
+  .querySelector('[data-action="switchDrive"]')
+  .addEventListener("click", async () => {
+    pickerOpen = true;
+    openList();
+    render(await invoke("lock"));
+    await openDrives();
+  });
 
 // --- Unlocked shell ---------------------------------------------------------
 
@@ -263,19 +279,11 @@ document
 
 // --- Conversations ----------------------------------------------------------
 
-/** Which conversation is on screen, as a hex identity key. */
 let openPeer = null;
-/** Our own identity key, for the share line. */
 let publicKey = "";
 
 const tabs = [...document.querySelectorAll("[data-tab]")];
 
-/**
- * Which tab owns each pane.
- *
- * A conversation is a sub-view of Messages rather than a tab of its own, so
- * the Messages tab stays selected while reading one.
- */
 const TAB_FOR_PANE = {
   messages: "messages",
   chat: "messages",
@@ -287,8 +295,6 @@ const TAB_FOR_PANE = {
 
 for (const tab of tabs) {
   tab.addEventListener("click", () => {
-    // Leaving a conversation returns to the list, so coming back to Messages
-    // never lands on a chat the user has mentally left.
     if (tab.dataset.tab === "messages") openList();
     else showPane(tab.dataset.tab);
   });
@@ -309,7 +315,6 @@ function showPane(name) {
   if (name === "settings") refreshSettings();
 }
 
-/** Identity keys are 64 hex characters; show enough to compare at a glance. */
 function shortFingerprint(hex) {
   return (
     hex
@@ -345,15 +350,12 @@ async function refreshConversations() {
   if (peers.length === 0 && groups.length === 0) {
     const empty = document.createElement("p");
     empty.className = "empty";
-    // Zero-state inbox: there is nothing to browse until someone is messaged.
     empty.textContent =
       "No conversations yet. Share your fingerprint from the Identity tab, or paste someone else's below to start one.";
     list.append(empty);
     return;
   }
 
-  // Groups first: there are fewer of them and they are easier to recognise by
-  // name than a conversation is by fingerprint.
   for (const group of groups) {
     const button = document.createElement("button");
     button.type = "button";
@@ -382,7 +384,6 @@ async function refreshConversations() {
 function appendBubble(message) {
   const bubble = document.createElement("div");
   bubble.className = `bubble ${message.outgoing ? "mine" : "theirs"}`;
-  // textContent, never innerHTML: message bodies are attacker-controlled.
   bubble.textContent = message.body;
 
   const stamp = document.createElement("time");
@@ -422,8 +423,6 @@ document
     await refreshConversations();
   });
 
-// Opening a conversation with someone new is just showing an empty one; the
-// session is established lazily when the first message is actually sent.
 document
   .querySelector('[data-form="newChat"]')
   .addEventListener("submit", async (event) => {
@@ -466,19 +465,15 @@ document
     }
   });
 
-// Messages arriving while the app is open.
 listen("wisp://message", async (event) => {
   const message = event.payload;
   if (message.peer === openPeer) {
     appendBubble(message);
   } else {
-    // A conversation that did not exist a moment ago now does.
     await refreshConversations();
   }
 });
 
-// The user's own link to the relay. Not presence — nothing here reports on
-// anyone else.
 listen("wisp://connection", (event) => {
   const { connected, detail } = event.payload;
   const dot = field("connectionDot");
@@ -486,7 +481,6 @@ listen("wisp://connection", (event) => {
   setText("connection", connected ? "connected" : detail || "offline");
 });
 
-/** Briefly confirms a copy on the button that triggered it. */
 async function copyToClipboard(button, text, label) {
   await navigator.clipboard.writeText(text);
   button.textContent = "Copied";
@@ -503,8 +497,6 @@ document
     ),
   );
 
-// The share line is the raw key, which is what the other side pastes into
-// "Start a conversation" — the spaced fingerprint is for reading aloud.
 document
   .querySelector('[data-action="copyShare"]')
   .addEventListener("click", (event) =>
@@ -513,7 +505,6 @@ document
 
 // --- Trusted Computer Binding -----------------------------------------------
 
-/** Latest unlocked status, so Settings can render without re-fetching. */
 let trustedComputer = { enabled: false, bindable: false };
 
 const toggleButton = document.querySelector(
@@ -555,7 +546,6 @@ async function renderTrustedComputer(status) {
   }
 }
 
-/** Which direction the confirm screen is currently asking about. */
 let pendingBinding = null;
 
 toggleButton.addEventListener("click", async () => {
@@ -574,7 +564,6 @@ toggleButton.addEventListener("click", async () => {
       ? `This will restrict this Wisp identity to ${label}. You will need your passphrase to change this setting later.`
       : `This Wisp identity will work on any authorised computer again, not just ${label}.`,
   );
-  // The lockout warning belongs on the enabling path only.
   field("tcConfirmWarning").hidden = !pendingBinding;
   field("tcConfirmSubmit").textContent = pendingBinding ? "Enable" : "Disable";
   setError("tcConfirmError", null);
@@ -616,16 +605,13 @@ document
 
 // --- Groups -----------------------------------------------------------------
 
-/** Which group is on screen, or null. */
 let openGroupId = null;
-/** Groups by id, so an incoming message can be matched to a name. */
 const knownGroups = new Map();
 
 function appendGroupBubble(message) {
   const bubble = document.createElement("div");
   bubble.className = `bubble ${message.outgoing ? "mine" : "theirs"}`;
 
-  // Any member could have written it, so incoming messages name the sender.
   if (!message.outgoing) {
     const who = document.createElement("span");
     who.className = "who";
@@ -633,7 +619,6 @@ function appendGroupBubble(message) {
     bubble.append(who);
   }
 
-  // textContent, never innerHTML: message bodies are attacker-controlled.
   const body = document.createElement("span");
   body.textContent = message.body;
   bubble.append(body);
@@ -712,7 +697,6 @@ document
       return;
     }
 
-    // Creating a group sends a key to every member, so it can take a moment.
     submit.disabled = true;
     submit.textContent = "Creating…";
     try {
@@ -757,7 +741,6 @@ document
     }
   });
 
-// A group message arriving while the app is open.
 listen("wisp://group-message", async (event) => {
   const message = event.payload;
   if (message.group === openGroupId) {
@@ -767,7 +750,6 @@ listen("wisp://group-message", async (event) => {
   }
 });
 
-// Someone shared their key, which is also how a new group first appears.
 listen("wisp://group", async (event) => {
   knownGroups.set(event.payload.id, event.payload);
   if (openGroupId === event.payload.id) {
@@ -782,13 +764,6 @@ function renderAbout(status) {
   setText("aboutDrive", status.mountPoint);
 }
 
-/**
- * Fills in the read-only parts of Settings.
- *
- * Re-read each time the tab is opened rather than cached: biometric hardware
- * can be disabled and enrolment removed while the app is running, and a stale
- * "available" would offer something that no longer works.
- */
 async function refreshSettings() {
   const [info, biometrics, computer] = await Promise.all([
     invoke("app_info"),
@@ -819,12 +794,6 @@ async function refreshSettings() {
 
 // --- Idle lock --------------------------------------------------------------
 
-/**
- * How long without input before the screen covers itself.
- *
- * This is a screen lock, not the USB gate: the key stays in memory and coming
- * back needs only a consent check. Pulling the drive is what actually wipes it.
- */
 const IDLE_AFTER_MS = 5 * 60 * 1000;
 
 let currentState = null;
@@ -832,7 +801,6 @@ let idleTimer = null;
 
 function resetIdleTimer() {
   clearTimeout(idleTimer);
-  // Only an unlocked session has anything to cover.
   if (currentState !== "unlocked") return;
   idleTimer = setTimeout(async () => {
     render(await invoke("begin_idle"));
@@ -844,8 +812,6 @@ for (const activity of ["mousemove", "mousedown", "keydown", "wheel", "touchstar
 }
 
 async function showBiometricCapability() {
-  // Spec: onboarding tells the user what their device supports, so an absent
-  // fingerprint reader is stated rather than silently implied.
   const availability = await invoke("biometric_capability");
   const supported = availability === "available";
   setText(
@@ -886,8 +852,6 @@ document
 
 // --- Wiring -----------------------------------------------------------------
 
-// Pushed by the USB watcher. This is what makes pulling the drive lock the
-// screen without the user touching anything.
 listen("wisp://status", (event) => render(event.payload));
 
 invoke("gate_status").then(render);

@@ -1,19 +1,6 @@
-//! HTTP and WebSocket surface.
-//!
-//! Four endpoints and a socket. There is no message history endpoint, no user
-//! search, no presence — none of those can exist without the server holding
-//! something it is not allowed to hold.
-//!
-//! ```text
-//! GET  /health
-//! POST /v1/register        invite code -> account
-//! POST /v1/auth/challenge  public key  -> nonce
-//! POST /v1/auth/verify     signature   -> session token
-//! GET  /v1/ws              authenticated envelope stream
-//! ```
-
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, FromRequestParts, State};
@@ -35,6 +22,7 @@ pub type AppState = Arc<Hub>;
 pub fn router(hub: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/v1/whoami", get(whoami))
         .route("/v1/register", post(register))
         .route("/v1/auth/challenge", post(auth_challenge))
         .route("/v1/auth/verify", post(auth_verify))
@@ -54,8 +42,6 @@ struct ErrorBody {
 
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
-        // Log the precise variant, return the sanitised one. The two differ
-        // deliberately for invite errors — see `ServerError::client_message`.
         if self.status_code() >= 500 {
             eprintln!("[wisp] internal error: {self}");
         }
@@ -73,25 +59,51 @@ impl IntoResponse for ServerError {
 
 // --- Client identity for throttling ----------------------------------------
 
-/// The address used as a throttling scope.
-///
-/// Falls back to `"unknown"` when the connection info is absent, which happens
-/// in tests. Behind a reverse proxy this must be replaced with a trusted
-/// forwarded-header reading — an untrusted `X-Forwarded-For` would let any
-/// caller pick their own rate-limit bucket, so it is deliberately not read here.
 struct ClientScope(String);
 
-impl<S: Send + Sync> FromRequestParts<S> for ClientScope {
+impl FromRequestParts<AppState> for ClientScope {
     type Rejection = std::convert::Infallible;
 
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|info| info.0.ip());
+        let forwarded = state
+            .client_ip_header()
+            .and_then(|name| header_address(&parts.headers, name));
+
         Ok(ClientScope(
-            parts
-                .extensions
-                .get::<ConnectInfo<SocketAddr>>()
-                .map(|info| info.0.ip().to_string())
+            forwarded
+                .or(peer)
+                .map(throttle_key)
                 .unwrap_or_else(|| "unknown".to_string()),
         ))
+    }
+}
+
+fn header_address(headers: &axum::http::HeaderMap, name: &str) -> Option<IpAddr> {
+    headers
+        .get(name)?
+        .to_str()
+        .ok()?
+        .rsplit(',')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn throttle_key(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+        }
     }
 }
 
@@ -101,13 +113,19 @@ async fn health() -> &'static str {
     "ok"
 }
 
+#[derive(Serialize)]
+struct WhoAmI {
+    address: String,
+}
+
+async fn whoami(ClientScope(address): ClientScope) -> Json<WhoAmI> {
+    Json(WhoAmI { address })
+}
+
 #[derive(Deserialize)]
 struct RegisterRequest {
-    invite_code: String,
     username: String,
-    /// 64 hex characters.
     public_key: String,
-    /// 128 hex characters.
     signature: String,
 }
 
@@ -121,7 +139,6 @@ async fn register(
 
     hub.relay.register(
         &scope,
-        &body.invite_code,
         &body.username,
         &public_key,
         &signature,
@@ -177,13 +194,6 @@ async fn auth_verify(
 
 // --- Prekeys ----------------------------------------------------------------
 
-/// Proof that the caller holds a valid session token.
-///
-/// Prekey publication has to be authenticated or anyone could overwrite anyone
-/// else's prekeys and make them unreachable. *Fetching* is authenticated too —
-/// not because bundles are secret, but so that an anonymous caller cannot drain
-/// a user's one-time prekey pool, which would silently degrade the forward
-/// secrecy of everyone who messages them next.
 struct Authenticated(PublicKey);
 
 impl FromRequestParts<AppState> for Authenticated {
@@ -203,16 +213,11 @@ impl FromRequestParts<AppState> for Authenticated {
         let public_key = state
             .resolve_token(token)
             .ok_or(ServerError::Unauthenticated)?;
-        // A token issued before the account was locked must stop working.
         state.ensure_active(&public_key)?;
         Ok(Authenticated(public_key))
     }
 }
 
-/// Key material on the wire, base64 rather than JSON number arrays.
-///
-/// A Kyber public key is 1568 bytes; as a JSON array that is roughly 6 KB of
-/// digits and commas per publish.
 #[derive(Debug, Deserialize, Serialize)]
 struct WireBundle {
     registration_id: i64,
@@ -302,10 +307,6 @@ impl WireBundle {
     }
 }
 
-/// Publishes (or rotates) the caller's own prekeys.
-///
-/// Scoped to the authenticated account, never to a key in the request body —
-/// otherwise the endpoint would let anyone replace anyone's prekeys.
 async fn publish_prekeys(
     State(hub): State<AppState>,
     Authenticated(owner): Authenticated,
@@ -336,8 +337,6 @@ async fn publish_prekeys(
     }))
 }
 
-/// How many one-time prekeys the caller has left, so a client can top up before
-/// running dry.
 async fn prekey_status(
     State(hub): State<AppState>,
     Authenticated(owner): Authenticated,
@@ -350,7 +349,6 @@ async fn prekey_status(
     }))
 }
 
-/// Fetches someone's bundle to start a session, consuming one one-time prekey.
 async fn fetch_prekeys(
     State(hub): State<AppState>,
     _auth: Authenticated,
@@ -376,26 +374,11 @@ async fn fetch_prekeys(
 
 #[derive(Debug, Serialize)]
 struct SenderCertificateResponse {
-    /// Base64 libsignal `SenderCertificate`.
     certificate: String,
-    /// Base64 trust root public key, for validating certificates from others.
     trust_root: String,
     expires_in: u64,
 }
 
-/// Issues the caller a certificate binding their own identity key to itself.
-///
-/// Issued for the **authenticated** account, never for a key named in the
-/// request — otherwise the endpoint would mint a certificate impersonating
-/// anyone who asked.
-///
-/// The trust root is returned alongside so a client learns it from the same
-/// relay it is already talking to. That is worth being honest about: it is
-/// trust-on-first-use against the relay, and a hostile relay could hand out its
-/// own root and issue itself certificates for any identity. Sealed sender
-/// removes the relay's *passive* view of who talks to whom; it does not make
-/// the relay untrusted for authenticity. The fingerprint users compare out of
-/// band is what does that.
 async fn sender_certificate(
     State(hub): State<AppState>,
     Authenticated(owner): Authenticated,
@@ -418,21 +401,16 @@ async fn sender_certificate(
 
 // --- WebSocket --------------------------------------------------------------
 
-/// Frames the client may send.
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientFrame {
-    /// Must be the first frame on the socket.
     Auth { token: String },
     Send {
-        /// Recipient public key, 64 hex characters.
         recipient: String,
-        /// Base64 sealed envelope.
         envelope: String,
     },
 }
 
-/// Frames the server sends.
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerFrame {
@@ -442,17 +420,22 @@ enum ServerFrame {
     Error { message: String },
 }
 
+const MAX_WS_MESSAGE_BYTES: usize = 512 * 1024;
+const AUTH_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+const PING_INTERVAL: Duration = Duration::from_secs(30);
+
 async fn websocket(ws: WebSocketUpgrade, State(hub): State<AppState>) -> Response {
-    ws.on_upgrade(move |socket| serve_socket(socket, hub))
+    ws.max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| serve_socket(socket, hub))
 }
 
-/// Authentication happens as the first *frame*, not as a query parameter.
-///
-/// A token in the URL ends up in proxy logs and browser history; a token in the
-/// opening frame does not. The socket is closed if the first frame is anything
-/// else, so an unauthenticated peer can never reach the message loop.
 async fn serve_socket(mut socket: WebSocket, hub: AppState) {
-    let Some(public_key) = authenticate_socket(&mut socket, &hub).await else {
+    let authenticated = tokio::time::timeout(AUTH_FRAME_TIMEOUT, authenticate_socket(&mut socket, &hub))
+        .await
+        .ok()
+        .flatten();
+    let Some(public_key) = authenticated else {
         let _ = socket.send(close_frame("authentication required")).await;
         return;
     };
@@ -460,15 +443,22 @@ async fn serve_socket(mut socket: WebSocket, hub: AppState) {
     let (wake_tx, mut wake_rx) = mpsc::unbounded_channel();
     hub.connect(&public_key, wake_tx);
 
-    // Anything queued while the client was away is delivered immediately.
     if drain(&mut socket, &hub, &public_key).await.is_err() {
         hub.disconnect(&public_key);
         return;
     }
     let _ = socket.send(json_frame(&ServerFrame::Ready)).await;
 
+    let mut ping = tokio::time::interval(PING_INTERVAL);
+    ping.tick().await;
+
     loop {
         tokio::select! {
+            _ = ping.tick() => {
+                if socket.send(Message::Ping(axum::body::Bytes::new())).await.is_err() {
+                    break;
+                }
+            }
             woken = wake_rx.recv() => {
                 if woken.is_none() { break; }
                 if drain(&mut socket, &hub, &public_key).await.is_err() {
@@ -483,7 +473,7 @@ async fn serve_socket(mut socket: WebSocket, hub: AppState) {
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
-                    Some(Ok(_)) => {} // ping/pong/binary: ignored
+                    Some(Ok(_)) => {}
                     Some(Err(_)) => break,
                 }
             }
@@ -502,7 +492,6 @@ async fn authenticate_socket(socket: &mut WebSocket, hub: &AppState) -> Option<P
     };
 
     let public_key = hub.resolve_token(&token)?;
-    // A token issued before the account was locked must stop working.
     hub.ensure_active(&public_key).ok()?;
     Some(public_key)
 }
@@ -519,8 +508,6 @@ async fn handle_frame(socket: &mut WebSocket, hub: &AppState, text: &str) -> Res
     };
 
     match frame {
-        // Re-authenticating mid-stream is not a thing; ignore rather than
-        // allowing an identity switch on a live socket.
         ClientFrame::Auth { .. } => Ok(()),
 
         ClientFrame::Send {
@@ -553,7 +540,6 @@ async fn handle_frame(socket: &mut WebSocket, hub: &AppState, text: &str) -> Res
     }
 }
 
-/// Delivers everything queued, deleting as it goes.
 async fn drain(socket: &mut WebSocket, hub: &AppState, recipient: &PublicKey) -> Result<(), ()> {
     let envelopes = hub.relay.collect(recipient).map_err(|_| ())?;
     for envelope in envelopes {
@@ -611,12 +597,11 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{now, Relay, Store};
+    use crate::{Relay, Store};
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
-    use wisp_invite::InviteCode;
 
     struct Harness {
         hub: AppState,
@@ -630,15 +615,6 @@ mod tests {
                     Default::default(),
                 ))),
             }
-        }
-
-        fn invite(&self) -> InviteCode {
-            let code = InviteCode::generate();
-            self.hub
-                .relay
-                .with_store(|s| s.create_invite(&code.redemption_hash(), now() + 3600, None))
-                .unwrap();
-            code
         }
 
         async fn post(&self, path: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
@@ -664,16 +640,11 @@ mod tests {
         wisp_core::UnlockedIdentity::generate("tester").unwrap()
     }
 
-    fn register_body(
-        key: &wisp_core::UnlockedIdentity,
-        code: &InviteCode,
-        username: &str,
-    ) -> serde_json::Value {
+    fn register_body(key: &wisp_core::UnlockedIdentity, username: &str) -> serde_json::Value {
         let public = key.public_key().unwrap();
         let canonical = wisp_core::identity::normalise_username(username);
-        let message = Relay::registration_challenge(code, &public, &crate::username_hash(&canonical));
+        let message = Relay::registration_challenge(&public, &crate::username_hash(&canonical));
         serde_json::json!({
-            "invite_code": code.to_string(),
             "username": username,
             "public_key": hex(&public),
             "signature": hex(&key.sign(&message).unwrap()),
@@ -691,60 +662,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registration_succeeds_with_a_valid_invite() {
+    async fn anyone_can_register_with_just_a_username_and_a_key() {
         let harness = Harness::new();
-        let code = harness.invite();
         let alice = client();
 
         let (status, _) = harness
-            .post("/v1/register", register_body(&alice, &code, "alice"))
+            .post("/v1/register", register_body(&alice, "alice"))
             .await;
         assert_eq!(status, StatusCode::CREATED);
     }
 
     #[tokio::test]
-    async fn registration_without_an_invite_is_refused() {
+    async fn a_leftover_invite_field_is_ignored() {
         let harness = Harness::new();
-        let alice = client();
-        let (status, body) = harness
-            .post(
-                "/v1/register",
-                register_body(&alice, &InviteCode::generate(), "alice"),
-            )
-            .await;
+        let mut body = register_body(&client(), "alice");
+        body["invite_code"] = serde_json::json!("WISP-AAAA-AAAA-AAAA-AAAA");
 
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"], "that invite code is not valid");
-    }
-
-    /// The client must not be able to tell a spent code from a nonexistent one.
-    #[tokio::test]
-    async fn a_spent_code_is_indistinguishable_from_an_unknown_one() {
-        let harness = Harness::new();
-        let code = harness.invite();
-        harness
-            .post("/v1/register", register_body(&client(), &code, "alice"))
-            .await;
-
-        let (spent_status, spent_body) = harness
-            .post("/v1/register", register_body(&client(), &code, "bob"))
-            .await;
-        let (unknown_status, unknown_body) = harness
-            .post(
-                "/v1/register",
-                register_body(&client(), &InviteCode::generate(), "bob"),
-            )
-            .await;
-
-        assert_eq!(spent_status, unknown_status);
-        assert_eq!(spent_body["error"], unknown_body["error"]);
+        let (status, _) = harness.post("/v1/register", body).await;
+        assert_eq!(status, StatusCode::CREATED);
     }
 
     #[tokio::test]
     async fn a_forged_signature_is_refused() {
         let harness = Harness::new();
-        let code = harness.invite();
-        let mut body = register_body(&client(), &code, "alice");
+        let mut body = register_body(&client(), "alice");
         body["public_key"] = serde_json::json!(hex(&client().public_key().unwrap()));
 
         let (status, _) = harness.post("/v1/register", body).await;
@@ -754,26 +695,162 @@ mod tests {
     #[tokio::test]
     async fn a_duplicate_username_conflicts() {
         let harness = Harness::new();
-        let first = harness.invite();
         harness
-            .post("/v1/register", register_body(&client(), &first, "alice"))
+            .post("/v1/register", register_body(&client(), "alice"))
             .await;
 
-        let second = harness.invite();
         let (status, _) = harness
-            .post("/v1/register", register_body(&client(), &second, "alice"))
+            .post("/v1/register", register_body(&client(), "alice"))
             .await;
         assert_eq!(status, StatusCode::CONFLICT);
     }
 
     #[tokio::test]
+    async fn signup_flooding_is_answered_with_429() {
+        let harness = Harness::new();
+        let limit = crate::RelayConfig::default().signups_per_address;
+
+        for i in 0..limit {
+            let (status, _) = harness
+                .post("/v1/register", register_body(&client(), &format!("user-{i}")))
+                .await;
+            assert_eq!(status, StatusCode::CREATED);
+        }
+        let (status, _) = harness
+            .post("/v1/register", register_body(&client(), "one-too-many"))
+            .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    // --- Throttling scope -------------------------------------------------
+
+    async fn scope_of_headers(hub: &AppState, headers: &[(&str, &str)]) -> String {
+        let mut builder = Request::builder().uri("/");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let (mut parts, _) = builder.body(()).unwrap().into_parts();
+        parts
+            .extensions
+            .insert(ConnectInfo(SocketAddr::from(([10, 0, 0, 1], 4000))));
+        let ClientScope(scope) = ClientScope::from_request_parts(&mut parts, hub)
+            .await
+            .unwrap();
+        scope
+    }
+
+    async fn scope_of(hub: &AppState, forwarded: Option<&str>) -> String {
+        match forwarded {
+            Some(value) => scope_of_headers(hub, &[("x-forwarded-for", value)]).await,
+            None => scope_of_headers(hub, &[]).await,
+        }
+    }
+
+    fn hub_with_header(header: &str) -> AppState {
+        Arc::new(
+            Hub::new(Relay::new(Store::in_memory().unwrap(), Default::default()))
+                .with_client_ip_header(Some(header.to_string())),
+        )
+    }
+    fn hub(trust_proxy: bool) -> AppState {
+        Arc::new(
+            Hub::new(Relay::new(Store::in_memory().unwrap(), Default::default()))
+                .with_trusted_proxy(trust_proxy),
+        )
+    }
+
+    #[tokio::test]
+    async fn forwarded_for_is_ignored_unless_the_proxy_is_trusted() {
+        let scope = scope_of(&hub(false), Some("198.51.100.9")).await;
+        assert_eq!(scope, "10.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn a_trusted_proxy_supplies_the_caller_address() {
+        let scope = scope_of(&hub(true), Some("198.51.100.9")).await;
+        assert_eq!(scope, "198.51.100.9");
+    }
+
+    #[tokio::test]
+    async fn only_the_last_forwarded_entry_is_believed() {
+        let scope = scope_of(&hub(true), Some("1.2.3.4, 5.6.7.8, 198.51.100.9")).await;
+        assert_eq!(scope, "198.51.100.9");
+    }
+
+    #[tokio::test]
+    async fn a_missing_or_junk_header_falls_back_to_the_peer() {
+        assert_eq!(scope_of(&hub(true), None).await, "10.0.0.1");
+        assert_eq!(scope_of(&hub(true), Some("not-an-ip")).await, "10.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn a_configured_header_supplies_the_caller_address() {
+        let hub = hub_with_header("X-Real-IP");
+        let scope = scope_of_headers(&hub, &[("x-real-ip", "198.51.100.9")]).await;
+        assert_eq!(scope, "198.51.100.9");
+    }
+
+    #[tokio::test]
+    async fn the_configured_header_wins_over_forwarded_for() {
+        let hub = hub_with_header("x-real-ip");
+        let scope = scope_of_headers(
+            &hub,
+            &[("x-real-ip", "198.51.100.9"), ("x-forwarded-for", "203.0.113.5")],
+        )
+        .await;
+        assert_eq!(scope, "198.51.100.9");
+    }
+
+    #[tokio::test]
+    async fn a_configured_header_that_is_absent_or_junk_falls_back_to_the_peer() {
+        let hub = hub_with_header("x-real-ip");
+        assert_eq!(scope_of_headers(&hub, &[]).await, "10.0.0.1");
+        assert_eq!(
+            scope_of_headers(&hub, &[("x-real-ip", "not-an-ip")]).await,
+            "10.0.0.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_header_nobody_configured_is_ignored() {
+        let scope = scope_of_headers(&hub(false), &[("x-real-ip", "198.51.100.9")]).await;
+        assert_eq!(scope, "10.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn whoami_reports_the_address_the_relay_throttles_on() {
+        let harness = Harness::new();
+        let request = Request::builder()
+            .uri("/v1/whoami")
+            .extension(ConnectInfo(SocketAddr::from(([203, 0, 113, 7], 5000))))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router(Arc::clone(&harness.hub))
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["address"], "203.0.113.7");
+    }
+    #[test]
+    fn ipv6_addresses_share_a_bucket_per_64() {
+        let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:ffff:ffff:ffff:ffff".parse().unwrap();
+        let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert_eq!(throttle_key(a), throttle_key(b));
+        assert_ne!(throttle_key(a), throttle_key(other));
+    }
+    #[tokio::test]
     async fn the_full_auth_handshake_issues_a_token() {
         let harness = Harness::new();
-        let code = harness.invite();
         let alice = client();
         let public = alice.public_key().unwrap();
         harness
-            .post("/v1/register", register_body(&alice, &code, "alice"))
+            .post("/v1/register", register_body(&alice, "alice"))
             .await;
 
         let (status, challenge) = harness
@@ -822,11 +899,10 @@ mod tests {
     #[tokio::test]
     async fn a_wrong_signature_does_not_authenticate() {
         let harness = Harness::new();
-        let code = harness.invite();
         let alice = client();
         let public = alice.public_key().unwrap();
         harness
-            .post("/v1/register", register_body(&alice, &code, "alice"))
+            .post("/v1/register", register_body(&alice, "alice"))
             .await;
         harness
             .post(

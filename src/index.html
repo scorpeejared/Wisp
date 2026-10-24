@@ -24,23 +24,18 @@
         <h1>This drive can't be used</h1>
         <p class="muted" data-field="reason"></p>
         <p class="muted small" data-field="mountPoint"></p>
+        <button type="button" class="ghost small" data-action="chooseDrive">Use a different drive</button>
       </section>
 
-      <!--
-        Gate: wrong drive. Deliberately bare — no username, no chat list, no
-        hint about the identity it is refusing.
-      -->
+      <!-- Gate: wrong drive. -->
       <section class="screen" data-screen="denied" hidden>
         <div class="mark deny" aria-hidden="true"></div>
         <h1>Access denied</h1>
         <p class="muted">This is not the drive this identity is bound to.</p>
+        <button type="button" class="ghost small" data-action="chooseDrive">Use a different drive</button>
       </section>
 
-      <!--
-        Gate: right drive, wrong computer. Like the wrong-drive screen this is
-        deliberately bare, but it names the actual problem so the user does not
-        go looking for a lost USB stick that is in their hand.
-      -->
+      <!-- Gate: right drive, wrong computer. -->
       <section class="screen" data-screen="deniedComputer" hidden>
         <div class="mark deny" aria-hidden="true"></div>
         <h1>Not this computer</h1>
@@ -52,6 +47,7 @@
           Trusted Computer Binding can only be turned off on the computer it is
           bound to.
         </p>
+        <button type="button" class="ghost small" data-action="chooseDrive">Use a different drive</button>
       </section>
 
       <!-- Gate: correct drive, awaiting passphrase. -->
@@ -73,6 +69,7 @@
           <p class="error" data-field="unlockError" hidden></p>
           <button type="submit" class="primary">Unlock</button>
         </form>
+        <button type="button" class="ghost small" data-action="chooseDrive">Use a different drive</button>
       </section>
 
       <!-- Gate: blank drive, offer registration. -->
@@ -88,26 +85,6 @@
         </div>
 
         <form data-form="register" autocomplete="off">
-          <!--
-            Invite code first: without a valid one there is no account to be
-            had, so it is the real gate. The format is checked locally as it is
-            typed, so a typo never costs a round trip.
-          -->
-          <label class="field">
-            <span>Invite code</span>
-            <input
-              type="text"
-              name="inviteCode"
-              autocomplete="off"
-              spellcheck="false"
-              placeholder="WISP-XXXX-XXXX-XXXX-XXXX"
-              required
-            />
-          </label>
-          <p class="muted small" data-field="inviteState">
-            Ask the person who invited you. Each code works once.
-          </p>
-
           <label class="field">
             <span>Username</span>
             <input
@@ -121,46 +98,45 @@
             />
           </label>
 
-          <label class="field">
-            <span>Passphrase</span>
-            <input
-              type="password"
-              name="passphrase"
-              autocomplete="off"
-              spellcheck="false"
-              required
-            />
-          </label>
-
-          <div class="meter" aria-hidden="true">
-            <div class="meter-fill" data-field="meterFill"></div>
-          </div>
-          <p class="muted small" data-field="strength">
-            Minimum 12 characters and 60 bits of estimated entropy.
-          </p>
-
-          <button type="button" class="ghost" data-action="generate">
-            Generate a strong phrase
-          </button>
-
-          <div class="notice" data-field="generated" hidden>
+          <div class="notice">
             <p class="small">
-              Write this down and store it somewhere safe. It is shown once and
-              cannot be recovered.
+              <strong>Your passphrase.</strong> Write it down and keep it
+              somewhere safe. It is shown once and cannot be recovered.
             </p>
-            <code data-field="generatedPhrase"></code>
+            <code data-field="generatedPhrase">…</code>
+            <button type="button" class="ghost small" data-action="generate">
+              Give me a different one
+            </button>
           </div>
+
+          <label class="check">
+            <input type="checkbox" name="saved" required />
+            <span>I have written this passphrase down.</span>
+          </label>
 
           <p class="muted small" data-field="biometricCapability"></p>
 
           <div class="notice deny">
-            There is no recovery. If you lose this drive or forget this
-            passphrase, the identity is gone permanently.
+            There is no recovery. If you lose this drive or this passphrase, the
+            identity is gone permanently.
           </div>
 
           <p class="error" data-field="registerError" hidden></p>
           <button type="submit" class="primary">Create identity</button>
         </form>
+        <button type="button" class="ghost small" data-action="chooseDrive">Use a different drive</button>
+      </section>
+
+      <!-- Choose a drive. -->
+      <section class="screen wide" data-screen="drives" hidden>
+        <div class="mark" aria-hidden="true"></div>
+        <h1>Choose a drive</h1>
+        <p class="muted small">
+          Each drive holds one identity. Switching locks the one that is open.
+        </p>
+        <ul class="drive-list" data-field="driveList"></ul>
+        <p class="error" data-field="driveError" hidden></p>
+        <button type="button" class="ghost" data-action="closeDrives">Back</button>
       </section>
 
       <!-- Unlocked. The only screen permitted to show app content. -->
@@ -173,15 +149,17 @@
               <span data-field="connection">connecting…</span>
             </div>
           </div>
-          <button type="button" class="ghost small" data-action="lock">
-            Lock
-          </button>
+          <div class="actions">
+            <button type="button" class="ghost small" data-action="switchDrive">
+              Switch drive
+            </button>
+            <button type="button" class="ghost small" data-action="lock">
+              Lock
+            </button>
+          </div>
         </header>
 
-        <!--
-          Messages. Empty until someone has been messaged: there is no
-          directory to browse, by design.
-        -->
+        <!-- Messages. -->
         <div class="pane" data-pane="messages">
           <div class="chats" data-field="conversationList"></div>
 
@@ -308,10 +286,7 @@
           </form>
         </div>
 
-        <!--
-          Identity. Desktop has no camera, so sharing an identity means reading
-          or pasting the fingerprint rather than scanning a code.
-        -->
+        <!-- Identity. -->
         <div class="pane scroll" data-pane="identity" hidden>
           <h2>Your identity</h2>
           <p class="muted small">
@@ -372,7 +347,7 @@
           <div class="setting">
             <div class="setting-head">
               <strong>Idle lock</strong>
-              <span class="badge on" data-field="idleState">ON</span>
+              <span class="badge on">ON</span>
             </div>
             <p class="muted small" data-field="idleDescription"></p>
           </div>
@@ -404,10 +379,7 @@
         </nav>
       </section>
 
-      <!--
-        Idle. The drive is still connected and the key is still held; this
-        covers the screen and nothing more.
-      -->
+      <!-- Idle. -->
       <section class="screen" data-screen="idle" hidden>
         <div class="mark" aria-hidden="true"></div>
         <h1>Locked</h1>

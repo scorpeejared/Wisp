@@ -1,33 +1,3 @@
-//! Sealed sender.
-//!
-//! Without it the relay sees *who is talking to whom* even though it cannot
-//! read a word — and that social graph is often the more damaging leak. Sealed
-//! sender moves the originator inside the ciphertext, encrypted to the
-//! recipient, so the relay sees only a destination.
-//!
-//! # How the recipient still knows who sent it
-//!
-//! A sender attaches a **sender certificate** issued by the relay, which the
-//! recipient validates against a **trust root** public key. The chain is:
-//!
-//! ```text
-//! trust root key  --signs-->  server certificate  --signs-->  sender certificate
-//! ```
-//!
-//! The relay therefore vouches that a public key belongs to an account, but the
-//! *message* it carries is sealed against it. This is worth being precise
-//! about: the relay could issue itself a certificate for any identity, so
-//! sealed sender does not make the relay untrusted for authenticity — that job
-//! belongs to the identity fingerprint users compare out of band. What it does
-//! remove is the relay's routine, passive view of who messages whom.
-//!
-//! # Identity strings
-//!
-//! libsignal addresses accounts by UUID because Signal does. Wisp has no
-//! UUIDs, so the lowercase hex identity key is used as the identifier
-//! throughout — one canonical form, derived from the key itself, so it cannot
-//! disagree with the key it names.
-
 use std::time::{Duration, SystemTime};
 
 use libsignal_protocol::{
@@ -39,18 +9,12 @@ use rand::TryRngCore;
 use crate::error::{MessagingError, MessagingResult};
 use crate::{device_id, Messenger};
 
-/// How long an issued sender certificate stays valid.
-///
-/// Short enough that a leaked certificate stops being useful quickly, long
-/// enough that a client is not fetching one per message.
 pub const CERTIFICATE_VALIDITY: Duration = Duration::from_secs(24 * 3600);
 
-/// Renders an identity key as the string libsignal will carry as the sender id.
 pub fn identity_string(public_key: &[u8; 32]) -> String {
     public_key.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Parses an identity string back into a key.
 pub fn identity_from_string(text: &str) -> Option<[u8; 32]> {
     if text.len() != 64 {
         return None;
@@ -62,11 +26,6 @@ pub fn identity_from_string(text: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// The relay's certificate issuer.
-///
-/// Holds two private keys: the trust root, which clients pin, and a server key
-/// that the trust root signs. They are separate so the signing key can be
-/// rotated without every client having to learn a new trust root.
 pub struct CertificateAuthority {
     trust_root: PrivateKey,
     server_key: KeyPair,
@@ -74,7 +33,6 @@ pub struct CertificateAuthority {
 }
 
 impl CertificateAuthority {
-    /// Mints a fresh authority. The caller must persist both private keys.
     pub fn generate() -> MessagingResult<Self> {
         let mut rng = rand::rngs::OsRng.unwrap_err();
         let trust_root = KeyPair::generate(&mut rng);
@@ -82,7 +40,6 @@ impl CertificateAuthority {
         Self::assemble(trust_root.private_key, server_key)
     }
 
-    /// Rebuilds an authority from persisted keys.
     pub fn restore(trust_root: &[u8], server_private: &[u8]) -> MessagingResult<Self> {
         let trust_root =
             PrivateKey::deserialize(trust_root).map_err(|e| MessagingError::Key(e.to_string()))?;
@@ -109,7 +66,6 @@ impl CertificateAuthority {
         })
     }
 
-    /// The value clients pin to validate certificates.
     pub fn trust_root_public(&self) -> MessagingResult<[u8; 32]> {
         self.trust_root
             .public_key()
@@ -127,7 +83,6 @@ impl CertificateAuthority {
         self.server_key.private_key.serialize()
     }
 
-    /// Issues a certificate binding an identity key to its own name.
     pub fn issue(
         &self,
         sender_identity: &[u8; 32],
@@ -159,10 +114,6 @@ impl CertificateAuthority {
 }
 
 impl Messenger {
-    /// Encrypts so the relay cannot tell who sent it.
-    ///
-    /// Requires a live session, same as an ordinary message — sealed sender
-    /// hides the sender, it does not replace the ratchet.
     pub async fn seal(
         &mut self,
         remote: &ProtocolAddress,
@@ -188,12 +139,6 @@ impl Messenger {
         .await?)
     }
 
-    /// Decrypts a sealed message, returning the sender's identity key.
-    ///
-    /// The sender is discovered here rather than supplied: the whole point is
-    /// that nothing outside the ciphertext said who it was from. The
-    /// certificate is validated against `trust_root`, so an unsigned or expired
-    /// claim is rejected before the plaintext is returned.
     pub async fn unseal(
         &mut self,
         trust_root: &[u8; 32],
@@ -259,7 +204,6 @@ mod tests {
         ProtocolAddress::new(identity_string(key), device_id())
     }
 
-    /// Sets up a live session from Alice to Bob.
     async fn linked() -> (Messenger, Messenger) {
         let mut alice = messenger(1001);
         let mut bob = messenger(2002);
@@ -281,8 +225,6 @@ mod tests {
         assert_eq!(identity_from_string(&"z".repeat(64)), None);
     }
 
-    /// The headline property: the recipient learns who sent it, from inside the
-    /// ciphertext, with nothing on the outside saying so.
     #[tokio::test]
     async fn a_sealed_message_carries_its_sender_inside() {
         let authority = CertificateAuthority::generate().unwrap();
@@ -304,8 +246,6 @@ mod tests {
         assert_eq!(plaintext, b"hello bob");
     }
 
-    /// The sender's identity must not be recoverable from the ciphertext by
-    /// anyone without the recipient's key — the relay included.
     #[tokio::test]
     async fn the_sender_identity_is_not_visible_in_the_ciphertext() {
         let authority = CertificateAuthority::generate().unwrap();
@@ -333,8 +273,6 @@ mod tests {
         );
     }
 
-    /// A certificate from an authority the recipient does not trust must be
-    /// refused, or anyone could claim to be anyone.
     #[tokio::test]
     async fn a_certificate_from_an_untrusted_authority_is_refused() {
         let real = CertificateAuthority::generate().unwrap();
@@ -364,7 +302,6 @@ mod tests {
         let trust_root = authority.trust_root_public().unwrap();
 
         let (mut alice, mut bob) = linked().await;
-        // Already expired when issued.
         let certificate = authority
             .issue(&identity_of(&alice), Duration::from_secs(0))
             .unwrap();
@@ -411,8 +348,6 @@ mod tests {
         ));
     }
 
-    /// An authority restored from persisted keys must issue certificates the
-    /// same clients still trust — otherwise a relay restart breaks everyone.
     #[tokio::test]
     async fn a_restored_authority_keeps_its_trust_root() {
         let original = CertificateAuthority::generate().unwrap();

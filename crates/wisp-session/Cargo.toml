@@ -10,7 +10,6 @@ publish.workspace = true
 [dependencies]
 wisp-core = { path = "../wisp-core" }
 wisp-usb = { path = "../wisp-usb" }
-wisp-invite = { path = "../wisp-invite" }
 wisp-machine = { path = "../wisp-machine" }
 thiserror.workspace = true
 serde = { version = "1", features = ["derive"] }

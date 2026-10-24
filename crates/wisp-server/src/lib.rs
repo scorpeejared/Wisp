@@ -1,39 +1,7 @@
-//! The Wisp relay.
-//!
-//! A dumb pipe with a guest list. It knows public keys, hashed usernames,
-//! invite records, and encrypted blobs it cannot read — and it forgets each
-//! blob the moment it is delivered.
-//!
-//! # What the relay can and cannot enforce
-//!
-//! The spec asks for failed *passphrase* attempts to be rate-limited
-//! server-side. That is not achievable, and this crate does not pretend
-//! otherwise: the passphrase decrypts `identity.wisp` locally, offline, with
-//! the relay unreachable. The server never observes an attempt and no
-//! server-side control can stop an attacker who holds the drive from grinding
-//! away on their own machine.
-//!
-//! What actually defends that path lives on the client: Argon2id at 128 MiB
-//! per guess, an enforced entropy floor, and the device fingerprint being a
-//! required input to the key.
-//!
-//! What the relay *can* enforce, and does:
-//!
-//! - **Invite redemption attempts**, per IP — the only defence against grinding
-//!   invite codes, and entirely the server's to make.
-//! - **Authentication attempts**, per public key and per IP.
-//! - **Account lockout** — refusing to relay for an account at all.
-//!
-//! Treating these three as real and the fourth as impossible is the honest
-//! split. A "server-side passphrase lockout" that relied on the client
-//! self-reporting failures would be defeated by a patched client, which is
-//! precisely the attacker in question.
-
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 use rand_core::{OsRng, RngCore};
-use wisp_invite::InviteCode;
 
 pub mod error;
 pub mod hub;
@@ -43,40 +11,43 @@ pub mod store;
 pub use error::{ServerError, ServerResult};
 pub use hub::Hub;
 pub use routes::router;
-pub use store::{now, username_hash, InviteRecord, PublicKey, Store};
+pub use store::{now, username_hash, PublicKey, Store};
 
+const GLOBAL_SIGNUP_SCOPE: &str = "signup:*";
 
-/// Tunables for the throttling policy.
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
-    /// Failed redemptions from one address before it is locked out.
-    pub redeem_attempts: u32,
-    pub redeem_lockout_secs: i64,
-    /// Failed authentications against one key before it is locked out.
+    pub signups_per_address: u32,
+    pub signups_global: u32,
+    pub signup_window_secs: i64,
+    pub register_failures: u32,
+    pub register_lockout_secs: i64,
     pub auth_attempts: u32,
     pub auth_lockout_secs: i64,
-    /// How long an issued challenge stays valid.
     pub challenge_ttl_secs: i64,
-    /// How long an undelivered message is kept before being dropped.
     pub message_ttl_secs: i64,
+    pub max_envelope_bytes: usize,
+    pub max_pending_per_recipient: i64,
 }
 
 impl Default for RelayConfig {
     fn default() -> Self {
         Self {
-            // Deliberately tight. A legitimate user types one code, once; ten
-            // failures from an address is already a script, not a person.
-            redeem_attempts: 10,
-            redeem_lockout_secs: 15 * 60,
+            signups_per_address: 5,
+            signups_global: 500,
+            signup_window_secs: 3600,
+            register_failures: 10,
+            register_lockout_secs: 15 * 60,
             auth_attempts: 10,
             auth_lockout_secs: 15 * 60,
             challenge_ttl_secs: 60,
             message_ttl_secs: 30 * 24 * 3600,
+            max_envelope_bytes: 256 * 1024,
+            max_pending_per_recipient: 1000,
         }
     }
 }
 
-/// An outstanding authentication challenge.
 struct Challenge {
     nonce: [u8; 32],
     expires_at: i64,
@@ -85,9 +56,6 @@ struct Challenge {
 pub struct Relay {
     store: Mutex<Store>,
     config: RelayConfig,
-    /// Challenges are deliberately in memory: they are single-use and live for
-    /// a minute, so persisting them across restarts buys nothing and would only
-    /// add a table to clean up.
     challenges: Mutex<HashMap<PublicKey, Challenge>>,
 }
 
@@ -110,49 +78,28 @@ impl Relay {
 
     // --- Registration -----------------------------------------------------
 
-    /// The bytes a client signs to prove it controls the identity it is
-    /// registering. See [`wisp_core::protocol::registration_challenge`].
-    pub fn registration_challenge(
-        invite: &InviteCode,
-        public_key: &PublicKey,
-        username_hash: &[u8; 32],
-    ) -> Vec<u8> {
-        wisp_core::protocol::registration_challenge(
-            &invite.redemption_hash().0,
-            public_key,
-            username_hash,
-        )
+    pub fn registration_challenge(public_key: &PublicKey, username_hash: &[u8; 32]) -> Vec<u8> {
+        wisp_core::protocol::registration_challenge(public_key, username_hash)
     }
 
-    /// Redeems an invite and creates an account.
-    ///
-    /// `client_scope` identifies the caller for throttling — an IP address in
-    /// production.
     pub fn register(
         &self,
         client_scope: &str,
-        code: &str,
         username: &str,
         public_key: &PublicKey,
         signature: &[u8],
     ) -> ServerResult<()> {
-        let scope = format!("redeem:{client_scope}");
-        self.check_lockout(&scope)?;
+        let fail_scope = format!("register-fail:{client_scope}");
+        self.check_lockout(&fail_scope)?;
 
-        // Parsing failures are throttled too. Without that, the checksum turns
-        // into a free filter an attacker can use to enumerate well-formed codes
-        // without ever touching the rate limit.
-        let outcome = self.register_inner(code, username, public_key, signature);
+        let outcome = self.register_inner(client_scope, username, public_key, signature);
 
         match &outcome {
-            Ok(()) => {
-                self.store.lock().unwrap().clear_failures(&scope)?;
-            }
-            // A username clash is the user's own mistake, not an attack; it
-            // must not count toward a lockout or a fumbled signup would lock
-            // the user out of onboarding entirely.
-            Err(ServerError::AlreadyRegistered) | Err(ServerError::BadUsername) => {}
-            Err(_) => self.register_failure(&scope)?,
+            Ok(()) => self.store.lock().unwrap().clear_failures(&fail_scope)?,
+            Err(ServerError::AlreadyRegistered)
+            | Err(ServerError::BadUsername)
+            | Err(ServerError::RateLimited { .. }) => {}
+            Err(_) => self.register_failure(&fail_scope)?,
         }
 
         outcome
@@ -160,36 +107,52 @@ impl Relay {
 
     fn register_inner(
         &self,
-        code: &str,
+        client_scope: &str,
         username: &str,
         public_key: &PublicKey,
         signature: &[u8],
     ) -> ServerResult<()> {
-        let invite = InviteCode::parse(code)?;
-
         let canonical = wisp_core::identity::normalise_username(username);
         wisp_core::identity::check_username(&canonical).map_err(|_| ServerError::BadUsername)?;
         let uname_hash = username_hash(&canonical);
 
-        let message = Self::registration_challenge(&invite, public_key, &uname_hash);
+        let message = Self::registration_challenge(public_key, &uname_hash);
         verify_signature(public_key, &message, signature)?;
 
-        let mut store = self.store.lock().unwrap();
-        store.redeem_and_register(&invite.redemption_hash(), public_key, &uname_hash)
+        let store = self.store.lock().unwrap();
+        let window = self.config.signup_window_secs;
+        let address_scope = format!("signup:{client_scope}");
+
+        for (scope, limit) in [
+            (address_scope.as_str(), self.config.signups_per_address),
+            (GLOBAL_SIGNUP_SCOPE, self.config.signups_global),
+        ] {
+            let (used, resets_in) = store.window_usage(scope, window)?;
+            if used >= limit {
+                return Err(ServerError::RateLimited {
+                    retry_after: resets_in,
+                });
+            }
+        }
+
+        store.create_account(public_key, &uname_hash)?;
+
+        store.bump_window(&address_scope, window)?;
+        store.bump_window(GLOBAL_SIGNUP_SCOPE, window)?;
+        Ok(())
     }
 
     fn register_failure(&self, scope: &str) -> ServerResult<()> {
         let store = self.store.lock().unwrap();
         let count = store.record_failure(scope)?;
-        if count >= self.config.redeem_attempts {
-            store.set_lockout(scope, now() + self.config.redeem_lockout_secs)?;
+        if count >= self.config.register_failures {
+            store.set_lockout(scope, now() + self.config.register_lockout_secs)?;
         }
         Ok(())
     }
 
     // --- Authentication ---------------------------------------------------
 
-    /// Issues a fresh challenge for an account to sign.
     pub fn issue_challenge(&self, public_key: &PublicKey) -> ServerResult<[u8; 32]> {
         if !self.store.lock().unwrap().account_exists(public_key)? {
             return Err(ServerError::UnknownAccount);
@@ -207,15 +170,10 @@ impl Relay {
         Ok(nonce)
     }
 
-    /// The bytes a client signs to answer a challenge.
     pub fn auth_message(nonce: &[u8; 32]) -> Vec<u8> {
         wisp_core::protocol::auth_message(nonce)
     }
 
-    /// Verifies a challenge response.
-    ///
-    /// The challenge is consumed whether or not verification succeeds, so a
-    /// single nonce can never be attacked more than once.
     pub fn verify_challenge(
         &self,
         client_scope: &str,
@@ -273,22 +231,26 @@ impl Relay {
 
     // --- Relay ------------------------------------------------------------
 
-    /// Queues an encrypted envelope. The recipient must be a known account.
     pub fn submit(&self, recipient: &PublicKey, envelope: &[u8]) -> ServerResult<()> {
+        if envelope.len() > self.config.max_envelope_bytes {
+            return Err(ServerError::BadRequest("envelope is too large".into()));
+        }
+
         let store = self.store.lock().unwrap();
         if !store.account_exists(recipient)? {
             return Err(ServerError::UnknownAccount);
+        }
+        if store.pending_count(recipient)? >= self.config.max_pending_per_recipient {
+            return Err(ServerError::MailboxFull);
         }
         store.queue_message(recipient, envelope)?;
         Ok(())
     }
 
-    /// Delivers and forgets everything queued for a recipient.
     pub fn collect(&self, recipient: &PublicKey) -> ServerResult<Vec<Vec<u8>>> {
         self.store.lock().unwrap().take_pending(recipient)
     }
 
-    /// Drops undelivered messages past their TTL. Call periodically.
     pub fn sweep(&self) -> ServerResult<usize> {
         self.store
             .lock()
@@ -297,12 +259,6 @@ impl Relay {
     }
 }
 
-/// Verifies a client signature.
-///
-/// Delegates to `wisp-core` rather than verifying here: identity keys are
-/// Curve25519 signing with XEdDSA, and a second implementation of that check
-/// is exactly the kind of divergence that ends with the relay accepting
-/// something the client would not, or vice versa.
 fn verify_signature(
     public_key: &PublicKey,
     message: &[u8],
@@ -325,8 +281,6 @@ mod tests {
 
     const IP: &str = "203.0.113.7";
 
-    /// Drives the same identity code the real client does, so these tests
-    /// break if the signature format ever diverges from what ships.
     struct Client {
         identity: wisp_core::UnlockedIdentity,
     }
@@ -346,10 +300,9 @@ mod tests {
             self.identity.sign(message).unwrap()
         }
 
-        fn register_signature(&self, code: &InviteCode, username: &str) -> [u8; 64] {
+        fn register_signature(&self, username: &str) -> [u8; 64] {
             let uname = wisp_core::identity::normalise_username(username);
-            let message =
-                Relay::registration_challenge(code, &self.public_key(), &username_hash(&uname));
+            let message = Relay::registration_challenge(&self.public_key(), &username_hash(&uname));
             self.sign(&message)
         }
     }
@@ -358,95 +311,83 @@ mod tests {
         Relay::in_memory().unwrap()
     }
 
-    fn fresh_invite(relay: &Relay) -> InviteCode {
-        let code = InviteCode::generate();
-        relay.with_store(|s| s.create_invite(&code.redemption_hash(), now() + 3600, None))
-            .unwrap();
-        code
+    fn relay_with(config: RelayConfig) -> Relay {
+        Relay::new(Store::in_memory().unwrap(), config)
     }
 
-    fn register(relay: &Relay, client: &Client, code: &InviteCode, username: &str) -> ServerResult<()> {
+    fn register_from(
+        relay: &Relay,
+        ip: &str,
+        client: &Client,
+        username: &str,
+    ) -> ServerResult<()> {
         relay.register(
-            IP,
-            &code.to_string(),
+            ip,
             username,
             &client.public_key(),
-            &client.register_signature(code, username),
+            &client.register_signature(username),
         )
     }
 
+    fn register(relay: &Relay, client: &Client, username: &str) -> ServerResult<()> {
+        register_from(relay, IP, client, username)
+    }
+
     #[test]
-    fn a_valid_invite_creates_an_account() {
+    fn anyone_can_create_an_account() {
         let relay = relay();
-        let code = fresh_invite(&relay);
         let alice = Client::new();
 
-        register(&relay, &alice, &code, "alice").unwrap();
+        register(&relay, &alice, "alice").unwrap();
         assert!(relay
             .with_store(|s| s.account_exists(&alice.public_key()))
             .unwrap());
     }
 
     #[test]
-    fn registration_without_an_invite_is_impossible() {
+    fn a_signature_from_another_key_is_rejected() {
         let relay = relay();
-        // A well-formed code that was never issued.
-        let code = InviteCode::generate();
         let alice = Client::new();
+        let mallory = Client::new();
 
-        assert!(matches!(
-            register(&relay, &alice, &code, "alice"),
-            Err(ServerError::InviteUnknown)
-        ));
+        let outcome = relay.register(
+            IP,
+            "alice",
+            &alice.public_key(),
+            &mallory.register_signature("alice"),
+        );
+        assert!(matches!(outcome, Err(ServerError::BadSignature)));
         assert!(!relay
             .with_store(|s| s.account_exists(&alice.public_key()))
             .unwrap());
     }
 
     #[test]
-    fn an_invite_works_exactly_once() {
+    fn a_signature_for_a_different_username_is_rejected() {
         let relay = relay();
-        let code = fresh_invite(&relay);
-
-        register(&relay, &Client::new(), &code, "alice").unwrap();
-        assert!(matches!(
-            register(&relay, &Client::new(), &code, "bob"),
-            Err(ServerError::InviteNotRedeemable)
-        ));
-    }
-
-    /// The signature must bind to the key being registered, or an intercepted
-    /// code could be bound to an attacker's key.
-    #[test]
-    fn a_signature_from_another_key_is_rejected() {
-        let relay = relay();
-        let code = fresh_invite(&relay);
         let alice = Client::new();
-        let mallory = Client::new();
 
         let outcome = relay.register(
             IP,
-            &code.to_string(),
             "alice",
             &alice.public_key(),
-            &mallory.register_signature(&code, "alice"),
+            &alice.register_signature("someone-else"),
         );
         assert!(matches!(outcome, Err(ServerError::BadSignature)));
     }
 
     #[test]
-    fn a_signature_for_a_different_username_is_rejected() {
+    fn an_invite_era_signature_is_rejected() {
         let relay = relay();
-        let code = fresh_invite(&relay);
         let alice = Client::new();
+        let uname = username_hash("alice");
 
-        let outcome = relay.register(
-            IP,
-            &code.to_string(),
-            "alice",
-            &alice.public_key(),
-            &alice.register_signature(&code, "someone-else"),
-        );
+        let mut old = b"wisp.register.v1".to_vec();
+        old.extend_from_slice(&[7u8; 32]);
+        old.extend_from_slice(&alice.public_key());
+        old.extend_from_slice(&uname);
+
+        let outcome = relay.register(IP, "alice", &alice.public_key(), &alice.sign(&old));
         assert!(matches!(outcome, Err(ServerError::BadSignature)));
     }
 
@@ -454,18 +395,8 @@ mod tests {
     fn usernames_are_normalised_before_registration() {
         let relay = relay();
         let alice = Client::new();
-        let code = fresh_invite(&relay);
 
-        // The client signs the canonical form; the server accepts the messy one.
-        relay
-            .register(
-                IP,
-                &code.to_string(),
-                "  Alice  ",
-                &alice.public_key(),
-                &alice.register_signature(&code, "  Alice  "),
-            )
-            .unwrap();
+        register(&relay, &alice, "  Alice  ").unwrap();
 
         assert!(relay
             .with_store(|s| s.username_taken(&username_hash("alice")))
@@ -475,94 +406,163 @@ mod tests {
     #[test]
     fn an_invalid_username_is_refused() {
         let relay = relay();
-        let code = fresh_invite(&relay);
         let alice = Client::new();
         assert!(matches!(
-            register(&relay, &alice, &code, "no"),
+            register(&relay, &alice, "no"),
             Err(ServerError::BadUsername)
         ));
     }
 
     #[test]
-    fn a_malformed_code_is_rejected() {
+    fn a_taken_username_conflicts() {
         let relay = relay();
-        let alice = Client::new();
-        let outcome = relay.register(IP, "WISP-NOPE", "alice", &alice.public_key(), &[0u8; 64]);
-        assert!(matches!(outcome, Err(ServerError::InviteMalformed(_))));
+        register(&relay, &Client::new(), "alice").unwrap();
+
+        assert!(matches!(
+            register(&relay, &Client::new(), "alice"),
+            Err(ServerError::AlreadyRegistered)
+        ));
     }
 
-    /// Grinding invite codes is the attack the relay actually has to stop.
-    #[test]
-    fn repeated_bad_redemptions_lock_the_address_out() {
-        let relay = relay();
-        let alice = Client::new();
+    // --- Signup limits ----------------------------------------------------
 
-        for _ in 0..RelayConfig::default().redeem_attempts {
-            let _ = register(&relay, &alice, &InviteCode::generate(), "alice");
+    fn tight(per_address: u32, global: u32) -> RelayConfig {
+        RelayConfig {
+            signups_per_address: per_address,
+            signups_global: global,
+            ..RelayConfig::default()
+        }
+    }
+
+    #[test]
+    fn one_address_cannot_mint_unlimited_accounts() {
+        let relay = relay_with(tight(3, 1000));
+
+        for i in 0..3 {
+            register(&relay, &Client::new(), &format!("user-{i}")).unwrap();
         }
 
-        // Even a genuine code is now refused from this address.
-        let real = fresh_invite(&relay);
+        let outcome = register(&relay, &Client::new(), "one-too-many");
+        match outcome {
+            Err(ServerError::RateLimited { retry_after }) => {
+                assert!(retry_after > 0 && retry_after <= 3600)
+            }
+            other => panic!("expected a rate limit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_per_address_limit_is_per_address() {
+        let relay = relay_with(tight(1, 1000));
+
+        register_from(&relay, "203.0.113.1", &Client::new(), "alice").unwrap();
+        register_from(&relay, "203.0.113.2", &Client::new(), "bob").unwrap();
+
         assert!(matches!(
-            register(&relay, &alice, &real, "alice"),
+            register_from(&relay, "203.0.113.1", &Client::new(), "carol"),
             Err(ServerError::RateLimited { .. })
         ));
     }
 
-    /// A user fumbling their own signup must not lock themselves out.
+    #[test]
+    fn the_global_cap_applies_across_addresses() {
+        let relay = relay_with(tight(10, 2));
+
+        register_from(&relay, "203.0.113.1", &Client::new(), "alice").unwrap();
+        register_from(&relay, "203.0.113.2", &Client::new(), "bob").unwrap();
+
+        assert!(matches!(
+            register_from(&relay, "203.0.113.3", &Client::new(), "carol"),
+            Err(ServerError::RateLimited { .. })
+        ));
+    }
+
+    #[test]
+    fn the_limit_lapses_when_the_window_does() {
+        let relay = relay_with(tight(1, 1000));
+        register(&relay, &Client::new(), "alice").unwrap();
+        assert!(matches!(
+            register(&relay, &Client::new(), "bob"),
+            Err(ServerError::RateLimited { .. })
+        ));
+
+        relay.with_store(|s| {
+            s.age_signup_windows_for_test(7200);
+        });
+        register(&relay, &Client::new(), "bob").unwrap();
+    }
+
+    #[test]
+    fn refused_registrations_do_not_spend_signup_budget() {
+        let relay = relay_with(tight(2, 1000));
+        register(&relay, &Client::new(), "alice").unwrap();
+
+        for _ in 0..5 {
+            let _ = register(&relay, &Client::new(), "alice");
+            let _ = register(&relay, &Client::new(), "x");
+        }
+        register(&relay, &Client::new(), "bob").unwrap();
+    }
+
     #[test]
     fn a_username_clash_does_not_count_toward_lockout() {
-        let relay = relay();
-        register(&relay, &Client::new(), &fresh_invite(&relay), "alice").unwrap();
+        let relay = relay_with(tight(1000, 100_000));
+        register(&relay, &Client::new(), "alice").unwrap();
 
         let bob = Client::new();
-        for _ in 0..RelayConfig::default().redeem_attempts + 5 {
-            let code = fresh_invite(&relay);
+        for _ in 0..RelayConfig::default().register_failures + 5 {
             assert!(matches!(
-                register(&relay, &bob, &code, "alice"),
+                register(&relay, &bob, "alice"),
                 Err(ServerError::AlreadyRegistered)
             ));
         }
 
-        // Still able to register under a free name.
-        let code = fresh_invite(&relay);
-        register(&relay, &bob, &code, "bob").unwrap();
+        register(&relay, &bob, "bob").unwrap();
     }
 
     #[test]
-    fn a_successful_registration_clears_the_failure_count() {
-        let relay = relay();
+    fn repeated_bad_registrations_lock_the_address_out() {
+        let relay = relay_with(tight(1000, 100_000));
         let alice = Client::new();
-        for _ in 0..5 {
-            let _ = register(&relay, &alice, &InviteCode::generate(), "alice");
-        }
-        register(&relay, &alice, &fresh_invite(&relay), "alice").unwrap();
+        let forged = Client::new();
 
-        let bob = Client::new();
-        for _ in 0..5 {
-            let _ = register(&relay, &bob, &InviteCode::generate(), "bob");
+        for _ in 0..RelayConfig::default().register_failures {
+            let _ = relay.register(
+                IP,
+                "alice",
+                &alice.public_key(),
+                &forged.register_signature("alice"),
+            );
         }
-        // Would have tripped the limit had the count not been reset.
-        register(&relay, &bob, &fresh_invite(&relay), "bob").unwrap();
+
+        assert!(matches!(
+            register(&relay, &alice, "alice"),
+            Err(ServerError::RateLimited { .. })
+        ));
     }
 
     #[test]
-    fn the_client_cannot_tell_an_unknown_code_from_a_spent_one() {
-        let relay = relay();
-        let spent = fresh_invite(&relay);
-        register(&relay, &Client::new(), &spent, "alice").unwrap();
+    fn a_few_bad_registrations_do_not_block_a_genuine_one() {
+        let relay = relay_with(tight(1000, 100_000));
+        let alice = Client::new();
+        let forged = Client::new();
 
-        let unknown = ServerError::InviteUnknown.client_message();
-        let used = ServerError::InviteNotRedeemable.client_message();
-        assert_eq!(unknown, used);
+        for _ in 0..5 {
+            let _ = relay.register(
+                IP,
+                "alice",
+                &alice.public_key(),
+                &forged.register_signature("alice"),
+            );
+        }
+        register(&relay, &alice, "alice").unwrap();
     }
 
     // --- Authentication ---------------------------------------------------
 
     fn registered(relay: &Relay, username: &str) -> Client {
         let client = Client::new();
-        let code = fresh_invite(relay);
-        register(relay, &client, &code, username).unwrap();
+        register(relay, &client, username).unwrap();
         client
     }
 
@@ -604,7 +604,6 @@ mod tests {
         ));
     }
 
-    /// A wrong answer burns the challenge, so one nonce cannot be ground on.
     #[test]
     fn a_failed_attempt_consumes_the_challenge() {
         let relay = relay();
@@ -691,9 +690,56 @@ mod tests {
     }
 
     #[test]
+    fn an_oversized_envelope_is_refused() {
+        let relay = relay_with(RelayConfig {
+            max_envelope_bytes: 1024,
+            ..RelayConfig::default()
+        });
+        let alice = registered(&relay, "alice");
+
+        relay.submit(&alice.public_key(), &[0u8; 1024]).unwrap();
+        assert!(matches!(
+            relay.submit(&alice.public_key(), &[0u8; 1025]),
+            Err(ServerError::BadRequest(_))
+        ));
+        assert_eq!(relay.collect(&alice.public_key()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_full_mailbox_refuses_more_until_it_is_collected() {
+        let relay = relay_with(RelayConfig {
+            max_pending_per_recipient: 3,
+            ..RelayConfig::default()
+        });
+        let alice = registered(&relay, "alice");
+
+        for _ in 0..3 {
+            relay.submit(&alice.public_key(), b"sealed").unwrap();
+        }
+        assert!(matches!(
+            relay.submit(&alice.public_key(), b"sealed"),
+            Err(ServerError::MailboxFull)
+        ));
+
+        assert_eq!(relay.collect(&alice.public_key()).unwrap().len(), 3);
+        relay.submit(&alice.public_key(), b"sealed").unwrap();
+    }
+
+    #[test]
+    fn one_full_mailbox_does_not_block_other_recipients() {
+        let relay = relay_with(RelayConfig {
+            max_pending_per_recipient: 1,
+            ..RelayConfig::default()
+        });
+        let alice = registered(&relay, "alice");
+        let bob = registered(&relay, "bob");
+
+        relay.submit(&alice.public_key(), b"sealed").unwrap();
+        assert!(relay.submit(&alice.public_key(), b"sealed").is_err());
+        relay.submit(&bob.public_key(), b"sealed").unwrap();
+    }
+    #[test]
     fn the_relay_cannot_read_what_it_carries() {
-        // Not a property a test can prove, but it can prove the relay never
-        // inspects the bytes: an envelope of pure noise round-trips unchanged.
         let relay = relay();
         let alice = registered(&relay, "alice");
         let mut noise = vec![0u8; 4096];

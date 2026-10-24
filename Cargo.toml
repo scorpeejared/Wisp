@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "crates/wisp-core",
-    "crates/wisp-invite",
     "crates/wisp-usb",
     "crates/wisp-session",
     "crates/wisp-server",
@@ -29,9 +28,6 @@ hmac = "0.12"
 hkdf = "0.12"
 rand_core = { version = "0.6", features = ["getrandom"] }
 
-# Argon2 and the AEAD are unusably slow when compiled without optimisation,
-# which makes an unoptimised `cargo test` run take minutes. Optimise the
-# crypto crates even in dev/test builds; everything else stays debuggable.
 [profile.dev.package.argon2]
 opt-level = 3
 [profile.dev.package.blake2]

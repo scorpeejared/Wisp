@@ -1,11 +1,3 @@
-//! Prints the removable volumes Wisp can see, and what it would bind to.
-//!
-//! `cargo run -p wisp-usb --example list_volumes`
-//!
-//! Useful for checking a specific USB stick before registering an identity on
-//! it — particularly whether it reports a device serial, since a drive without
-//! one can only be bound weakly.
-
 use wisp_usb::{PlatformVolumeProvider, VolumeProvider};
 
 fn main() {

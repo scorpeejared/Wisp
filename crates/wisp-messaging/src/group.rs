@@ -1,57 +1,21 @@
-//! Groups, and the sender-key protocol that makes them work.
-//!
-//! # How a group message travels
-//!
-//! The body is encrypted **once** with the group's sender key, then wrapped per
-//! recipient in sealed sender and sent as an ordinary delivery. So a group of
-//! five is five deliveries of the same ciphertext, not five encryptions of the
-//! body.
-//!
-//! # The relay knows nothing about groups
-//!
-//! There is no group on the server: no membership list, no group id, no
-//! endpoint. Fan-out happens on the client, and each delivery looks like any
-//! other message to a single recipient. The relay cannot enumerate a group or
-//! learn who is in one.
-//!
-//! What it *can* observe is timing — several deliveries leaving at once. Sealed
-//! sender means it does not learn who sent them, but a relay watching closely
-//! could infer that some set of accounts is related. Fixing that needs cover
-//! traffic or batching, which is out of scope here and worth stating plainly
-//! rather than implying groups are invisible.
-//!
-//! # Membership is not enforced
-//!
-//! Anyone holding the sender key can read the group, and membership is whatever
-//! each member's client believes. There is no server to arbitrate and no group
-//! admin. Removing someone therefore requires the remaining members to rotate
-//! to a new group — which is what `SenderKeyStore` retaining per-distribution
-//! keys makes possible, but is not implemented here.
-
 use uuid::Uuid;
 
 use crate::error::{MessagingError, MessagingResult};
 use crate::vault::Vault;
 
 const NS_GROUP: &str = "group";
-/// Enough for the invite-only setting this is built for, and a bound on what a
-/// hostile distribution message can make us store.
 pub const MAX_MEMBERS: usize = 128;
 pub const MAX_NAME_CHARS: usize = 64;
 
-/// A group as this client understands it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Group {
-    /// Also the sender-key distribution id.
     pub id: Uuid,
     pub name: String,
-    /// Every identity in the group, including our own.
     pub members: Vec<[u8; 32]>,
     pub created_at: u64,
 }
 
 impl Group {
-    /// Everyone except us — the set a message is actually delivered to.
     pub fn others(&self, me: &[u8; 32]) -> Vec<[u8; 32]> {
         self.members
             .iter()
@@ -80,7 +44,7 @@ impl Group {
 
         let name = self.name.as_bytes();
         let mut out = Vec::with_capacity(1 + 8 + 1 + name.len() + 2 + self.members.len() * 32);
-        out.push(1); // record version
+        out.push(1);
         out.extend_from_slice(&self.created_at.to_be_bytes());
         out.push(name.len() as u8);
         out.extend_from_slice(name);
@@ -92,7 +56,6 @@ impl Group {
     }
 
     fn decode(id: Uuid, bytes: &[u8]) -> MessagingResult<Self> {
-        // Version, timestamp, name length: 10 bytes before anything variable.
         if bytes.len() < 10 || bytes[0] != 1 {
             return Err(MessagingError::Malformed);
         }
@@ -141,7 +104,6 @@ impl Group {
     }
 }
 
-/// Groups, stored encrypted in the same vault as everything else.
 pub struct Groups<'v> {
     vault: &'v Vault,
 }
@@ -163,7 +125,6 @@ impl<'v> Groups<'v> {
         }
     }
 
-    /// Every group, oldest first.
     pub fn list(&self) -> MessagingResult<Vec<Group>> {
         let mut groups = Vec::new();
         for key in self.vault.keys(NS_GROUP)? {
@@ -171,8 +132,6 @@ impl<'v> Groups<'v> {
                 continue;
             };
             let id = Uuid::from_bytes(raw);
-            // A record that will not decode is skipped rather than failing the
-            // whole list: one bad group must not hide the rest.
             if let Ok(Some(group)) = self.get(&id) {
                 groups.push(group);
             }
@@ -243,12 +202,9 @@ mod tests {
         assert_eq!(listed, vec![100, 200, 300]);
     }
 
-    /// Fan-out must not send a message back to ourselves.
     #[test]
     fn others_excludes_us() {
         assert_eq!(group().others(&ME), vec![ALICE, BOB]);
-        // Someone not in the group gets the whole membership, which is correct:
-        // there is nobody to exclude.
         assert_eq!(group().others(&[9u8; 32]).len(), 3);
     }
 
@@ -287,8 +243,6 @@ mod tests {
             .is_err());
     }
 
-    /// A hostile distribution message must not be able to make us store an
-    /// unbounded membership.
     #[test]
     fn oversized_groups_are_refused() {
         let vault = vault();

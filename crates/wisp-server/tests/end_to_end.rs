@@ -1,22 +1,13 @@
-//! End-to-end coverage of the real relay over a real socket.
-//!
-//! The unit tests exercise handlers in isolation; this drives the whole thing
-//! the way a client does — HTTP registration, the challenge/response handshake,
-//! then a WebSocket carrying an envelope from one account to another. The
-//! delivery path has no other coverage, and it is the part that actually has to
-//! work for Wisp to be a chat app.
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
-use wisp_invite::InviteCode;
 use wisp_server::{now, router, Hub, PublicKey, Relay, RelayConfig, Store};
 
 struct TestServer {
-    address: SocketAddr,
+    base: String,
     hub: Arc<Hub>,
 }
 
@@ -27,7 +18,6 @@ impl TestServer {
             RelayConfig::default(),
         )));
 
-        // Port 0: let the OS pick, so parallel test runs never collide.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
 
@@ -41,24 +31,33 @@ impl TestServer {
             .unwrap();
         });
 
-        Self { address, hub }
+        Self {
+            base: format!("http://{address}"),
+            hub,
+        }
+    }
+
+    fn external(url: &str) -> Self {
+        let hub = Arc::new(Hub::new(Relay::new(
+            Store::in_memory().unwrap(),
+            RelayConfig::default(),
+        )));
+        Self {
+            base: url.trim_end_matches('/').to_string(),
+            hub,
+        }
     }
 
     fn url(&self, path: &str) -> String {
-        format!("http://{}{path}", self.address)
+        format!("{}{path}", self.base)
     }
 
     fn ws_url(&self) -> String {
-        format!("ws://{}/v1/ws", self.address)
-    }
-
-    fn new_invite(&self) -> InviteCode {
-        let code = InviteCode::generate();
-        self.hub
-            .relay
-            .with_store(|s| s.create_invite(&code.redemption_hash(), now() + 3600, None))
-            .unwrap();
-        code
+        let base = self
+            .base
+            .replacen("https://", "wss://", 1)
+            .replacen("http://", "ws://", 1);
+        format!("{base}/v1/ws")
     }
 }
 
@@ -81,12 +80,9 @@ impl TestClient {
         hex(&self.public_key())
     }
 
-    /// Full signup: redeem an invite and create the account.
     async fn register(&self, server: &TestServer, username: &str) {
-        let code = server.new_invite();
         let canonical = wisp_core::identity::normalise_username(username);
         let message = Relay::registration_challenge(
-            &code,
             &self.public_key(),
             &wisp_server::username_hash(&canonical),
         );
@@ -94,7 +90,6 @@ impl TestClient {
         let response = reqwest::Client::new()
             .post(server.url("/v1/register"))
             .json(&serde_json::json!({
-                "invite_code": code.to_string(),
                 "username": username,
                 "public_key": self.public_hex(),
                 "signature": hex(&self.identity.sign(&message).unwrap()),
@@ -106,7 +101,6 @@ impl TestClient {
         assert_eq!(response.status(), 201, "registration failed for {username}");
     }
 
-    /// Challenge/response handshake, returning a session token.
     async fn authenticate(&self, server: &TestServer) -> String {
         let http = reqwest::Client::new();
 
@@ -149,7 +143,6 @@ type Socket = tokio_tungstenite::WebSocketStream<
     tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
 >;
 
-/// Connects and completes the in-band authentication frame.
 async fn connect(server: &TestServer, token: &str) -> Socket {
     let (mut socket, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
@@ -164,7 +157,6 @@ async fn connect(server: &TestServer, token: &str) -> Socket {
     socket
 }
 
-/// Reads frames until one matches `wanted`, or times out.
 async fn expect_frame(socket: &mut Socket, wanted: &str) -> serde_json::Value {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -197,8 +189,6 @@ async fn a_message_travels_from_one_account_to_another() {
     let mut bob_socket = connect(&server, &bob.authenticate(&server).await).await;
     expect_frame(&mut bob_socket, "ready").await;
 
-    // Bob sends Alice an opaque envelope. The relay cannot read it and, under
-    // sealed sender, cannot tell it came from Bob.
     let envelope = b"a sealed sender ciphertext";
     bob_socket
         .send(Message::Text(
@@ -221,8 +211,6 @@ async fn a_message_travels_from_one_account_to_another() {
     );
 }
 
-/// A message sent while the recipient is offline must be waiting when they
-/// return — and must be gone from the relay once collected.
 #[tokio::test]
 async fn messages_queued_while_offline_arrive_on_reconnect() {
     let server = TestServer::start().await;
@@ -235,7 +223,6 @@ async fn messages_queued_while_offline_arrive_on_reconnect() {
     let mut bob_socket = connect(&server, &bob.authenticate(&server).await).await;
     expect_frame(&mut bob_socket, "ready").await;
 
-    // Alice is not connected at all.
     bob_socket
         .send(Message::Text(
             serde_json::json!({
@@ -256,7 +243,6 @@ async fn messages_queued_while_offline_arrive_on_reconnect() {
         b"while you were out".to_vec()
     );
 
-    // Delivered means forgotten.
     assert_eq!(
         server
             .hub
@@ -272,7 +258,6 @@ async fn a_socket_without_a_valid_token_is_refused() {
     let server = TestServer::start().await;
     let mut socket = connect(&server, "not-a-real-token").await;
 
-    // The server reports the failure and closes rather than serving anything.
     let mut sent_ready = false;
     while let Some(Ok(message)) = socket.next().await {
         if let Message::Text(text) = message {
@@ -291,7 +276,6 @@ async fn a_token_stops_working_once_the_account_is_locked() {
     let alice = TestClient::new();
     alice.register(&server, "alice").await;
 
-    // Token issued before the lock.
     let token = alice.authenticate(&server).await;
     server
         .hub
@@ -352,7 +336,6 @@ async fn a_malformed_frame_does_not_kill_the_socket() {
         .unwrap();
     expect_frame(&mut socket, "error").await;
 
-    // Still usable afterwards.
     socket
         .send(Message::Text(
             serde_json::json!({
@@ -369,8 +352,6 @@ async fn a_malformed_frame_does_not_kill_the_socket() {
 
 // --- Prekey distribution ---------------------------------------------------
 
-/// A minimal publishable bundle. The relay stores key material verbatim and
-/// never interprets it, so these bytes need only be well-formed base64.
 fn wire_bundle(tag: u8) -> serde_json::Value {
     serde_json::json!({
         "registration_id": 4242,
@@ -429,7 +410,6 @@ async fn prekeys_can_be_published_and_fetched() {
     assert_eq!(published["one_time_prekeys_stored"], 3);
     assert_eq!(published["one_time_prekeys_available"], 3);
 
-    // Alice fetches Bob's bundle to start a session.
     let alice_token = alice.authenticate(&server).await;
     let response = fetch(&server, &alice_token, &bob.public_hex()).await;
     assert_eq!(response.status(), 200);
@@ -443,8 +423,6 @@ async fn prekeys_can_be_published_and_fetched() {
     );
 }
 
-/// Each fetch must consume a distinct one-time prekey, and the pool must run
-/// down to empty rather than repeating.
 #[tokio::test]
 async fn one_time_prekeys_are_handed_out_once_each_over_http() {
     let server = TestServer::start().await;
@@ -469,7 +447,6 @@ async fn one_time_prekeys_are_handed_out_once_each_over_http() {
     issued.sort_unstable();
     assert_eq!(issued, vec![1, 2], "each key must be issued exactly once");
 
-    // Pool exhausted: the bundle still works, without a one-time key.
     let fetched: serde_json::Value = fetch(&server, &alice_token, &bob.public_hex())
         .await
         .json()
@@ -478,7 +455,6 @@ async fn one_time_prekeys_are_handed_out_once_each_over_http() {
     assert!(fetched["one_time_prekey"].is_null());
     assert_eq!(fetched["identity_key"], base64(&[0xAA; 33]));
 
-    // And Bob can see he needs to top up.
     let status: serde_json::Value = reqwest::Client::new()
         .get(server.url("/v1/prekeys"))
         .bearer_auth(&bob_token)
@@ -491,8 +467,6 @@ async fn one_time_prekeys_are_handed_out_once_each_over_http() {
     assert_eq!(status["one_time_prekeys_available"], 0);
 }
 
-/// Publication is scoped to the authenticated account, so nobody can overwrite
-/// someone else's prekeys and make them unreachable.
 #[tokio::test]
 async fn publishing_requires_authentication() {
     let server = TestServer::start().await;
@@ -511,9 +485,6 @@ async fn publishing_requires_authentication() {
     assert_eq!(response.status(), 401);
 }
 
-/// Fetching is authenticated too — otherwise an anonymous caller could drain
-/// someone's one-time prekey pool and silently degrade everyone who messages
-/// them next.
 #[tokio::test]
 async fn fetching_requires_authentication() {
     let server = TestServer::start().await;
@@ -552,7 +523,6 @@ async fn fetching_an_account_with_no_prekeys_is_a_clean_404() {
     assert_eq!(response.status(), 404);
 }
 
-/// Rotating a signed prekey replaces it rather than accumulating.
 #[tokio::test]
 async fn republishing_rotates_the_bundle() {
     let server = TestServer::start().await;
@@ -598,8 +568,6 @@ use wisp_messaging::{
 };
 
 impl TestClient {
-    /// Builds the messaging layer on top of this client's USB-held identity,
-    /// exactly as the app does after unlocking.
     fn messenger(&self, registration_id: u32) -> Messenger {
         let identity =
             identity_from_private_key(self.identity.key_material().as_slice()).unwrap();
@@ -611,7 +579,6 @@ impl TestClient {
         address_for(&self.public_key())
     }
 
-    /// Publishes prekeys through the real HTTP endpoint.
     async fn publish_prekeys(&self, server: &TestServer, token: &str, messenger: &mut Messenger) {
         let published = messenger.generate_prekeys(1, 1, 100, 5).await.unwrap();
 
@@ -639,7 +606,6 @@ impl TestClient {
         assert_eq!(response.status(), 200);
     }
 
-    /// Fetches a sender certificate and the trust root.
     async fn sender_certificate(&self, server: &TestServer, token: &str) -> (Vec<u8>, [u8; 32]) {
         let body: serde_json::Value = reqwest::Client::new()
             .post(server.url("/v1/sender-certificate"))
@@ -659,7 +625,6 @@ impl TestClient {
     }
 }
 
-/// Starts a session with `target` by fetching their bundle over HTTP.
 async fn start_session(
     server: &TestServer,
     token: &str,
@@ -700,8 +665,6 @@ async fn start_session(
     messenger.start_session(&target.address(), &bundle).await.unwrap();
 }
 
-/// The whole point of the project: a real end-to-end encrypted message, sealed
-/// against the relay, travelling over the relay.
 #[tokio::test]
 async fn a_sealed_message_travels_end_to_end_through_the_relay() {
     let server = TestServer::start().await;
@@ -717,26 +680,21 @@ async fn a_sealed_message_travels_end_to_end_through_the_relay() {
     let mut alice_messenger = alice.messenger(1001);
     let mut bob_messenger = bob.messenger(2002);
 
-    // Bob publishes prekeys so he can be reached while offline.
     bob.publish_prekeys(&server, &bob_token, &mut bob_messenger).await;
 
-    // Alice fetches them and builds a session.
     start_session(&server, &alice_token, &mut alice_messenger, &bob).await;
 
-    // Alice seals a message. The relay cannot tell it came from her.
     let (certificate, _) = alice.sender_certificate(&server, &alice_token).await;
     let sealed = alice_messenger
         .seal(&bob.address(), &certificate, b"the eagle lands at dawn")
         .await
         .unwrap();
 
-    // The relay never sees Alice's identity in what it carries.
     assert!(
         !sealed.windows(32).any(|w| w == alice.public_key()),
         "the sender's key is visible in what the relay carries"
     );
 
-    // Send it.
     let mut alice_socket = connect(&server, &alice_token).await;
     expect_frame(&mut alice_socket, "ready").await;
     alice_socket
@@ -752,7 +710,6 @@ async fn a_sealed_message_travels_end_to_end_through_the_relay() {
         .unwrap();
     expect_frame(&mut alice_socket, "accepted").await;
 
-    // Bob collects and opens it.
     let mut bob_socket = connect(&server, &bob_token).await;
     let delivered = expect_frame(&mut bob_socket, "envelope").await;
     let received = unbase64(delivered["data"].as_str().unwrap());
@@ -764,8 +721,6 @@ async fn a_sealed_message_travels_end_to_end_through_the_relay() {
     assert_eq!(plaintext, b"the eagle lands at dawn");
 }
 
-/// The unsealed path, for completeness: the wire envelope carries the sender
-/// explicitly, and both parties can hold a conversation.
 #[tokio::test]
 async fn an_unsealed_conversation_works_over_the_relay() {
     let server = TestServer::start().await;
@@ -829,8 +784,6 @@ async fn a_sender_certificate_requires_authentication() {
     assert_eq!(response.status(), 401);
 }
 
-/// The trust root must survive a relay restart, or every certificate already
-/// issued would stop validating.
 #[tokio::test]
 async fn the_trust_root_is_stable_across_requests() {
     let server = TestServer::start().await;
@@ -843,6 +796,83 @@ async fn the_trust_root_is_stable_across_requests() {
     assert_eq!(first, second);
 }
 
+// --- Deployed relay ---------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "needs WISP_TEST_RELAY_URL pointing at a deployed relay"]
+async fn a_deployed_relay_carries_messages_and_keeps_idle_sockets_open() {
+    let url = std::env::var("WISP_TEST_RELAY_URL").expect("set WISP_TEST_RELAY_URL");
+    let idle_secs: u64 = std::env::var("WISP_TEST_IDLE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let server = TestServer::external(&url);
+
+    let tag = hex(&rand_tag());
+    let alice = TestClient::new();
+    let bob = TestClient::new();
+    alice.register(&server, &format!("smoke-a-{tag}")).await;
+    bob.register(&server, &format!("smoke-b-{tag}")).await;
+
+    let mut alice_socket = connect(&server, &alice.authenticate(&server).await).await;
+    expect_frame(&mut alice_socket, "ready").await;
+    let mut bob_socket = connect(&server, &bob.authenticate(&server).await).await;
+    expect_frame(&mut bob_socket, "ready").await;
+
+    send_envelope(&mut bob_socket, &alice, b"first, straight away").await;
+    let first = expect_frame(&mut alice_socket, "envelope").await;
+    assert_eq!(
+        unbase64(first["data"].as_str().unwrap()),
+        b"first, straight away".to_vec()
+    );
+    println!("first message delivered");
+
+    if idle_secs > 0 {
+        println!("holding both sockets idle for {idle_secs}s");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(idle_secs);
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                frame = alice_socket.next() => {
+                    assert!(matches!(frame, Some(Ok(_))), "alice's socket ended while idle: {frame:?}");
+                }
+                frame = bob_socket.next() => {
+                    assert!(matches!(frame, Some(Ok(_))), "bob's socket ended while idle: {frame:?}");
+                }
+            }
+        }
+        println!("both sockets survived the idle wait");
+    }
+
+    send_envelope(&mut alice_socket, &bob, b"second, after the wait").await;
+    let second = expect_frame(&mut bob_socket, "envelope").await;
+    assert_eq!(
+        unbase64(second["data"].as_str().unwrap()),
+        b"second, after the wait".to_vec()
+    );
+    println!("second message delivered");
+}
+
+async fn send_envelope(socket: &mut Socket, to: &TestClient, bytes: &[u8]) {
+    socket
+        .send(Message::Text(
+            serde_json::json!({
+                "type": "send",
+                "recipient": to.public_hex(),
+                "envelope": base64(bytes),
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    expect_frame(socket, "accepted").await;
+}
+
+fn rand_tag() -> [u8; 4] {
+    let mut bytes = [0u8; 4];
+    rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut bytes);
+    bytes
+}
 // --- helpers ---------------------------------------------------------------
 
 fn hex(bytes: &[u8]) -> String {

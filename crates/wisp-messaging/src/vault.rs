@@ -1,29 +1,3 @@
-//! Encrypted-at-rest local storage.
-//!
-//! Signal's stores hold material that is as sensitive as the identity key
-//! itself: session states carry the ratchet keys for every conversation, and
-//! anyone who reads them can decrypt traffic. The spec requires local storage
-//! to be encrypted with a key held on the USB drive, and this is where that
-//! happens.
-//!
-//! # Key schedule
-//!
-//! ```text
-//! vault_key = HKDF-SHA256(ikm = identity secret, salt = per-vault random,
-//!                         info = "wisp.vault.v1")
-//! record    = XChaCha20-Poly1305(vault_key, nonce, aad = namespace || key)
-//! ```
-//!
-//! The salt is stored in the clear beside the data; the identity secret never
-//! is. Pull the drive and the vault is inert — which is the point. The AAD
-//! binds every ciphertext to its own slot, so a stored record cannot be lifted
-//! and replayed into a different one: swapping one conversation's session blob
-//! into another's would otherwise be undetectable.
-//!
-//! Each write uses a fresh random nonce. XChaCha20's 192-bit nonce makes random
-//! generation safe without tracking a counter across restarts, which a 96-bit
-//! nonce would not.
-
 use chacha20poly1305::{
     aead::{Aead, Payload},
     KeyInit, XChaCha20Poly1305, XNonce,
@@ -57,24 +31,12 @@ CREATE TABLE IF NOT EXISTS records (
 );
 "#;
 
-/// A local database whose every value is encrypted under a key derived from the
-/// USB-held identity secret.
-///
-/// The connection sits behind a `Mutex` so the vault is `Sync`. libsignal wants
-/// each of its stores as a separate `&mut` field, so they all share one
-/// `Arc<Vault>`; without the mutex that sharing could not cross a thread, and
-/// the Tauri layer needs the whole thing to be `Send + Sync`.
 pub struct Vault {
     conn: std::sync::Mutex<Connection>,
     key: SecretBytes,
 }
 
 impl Vault {
-    /// Opens (or creates) a vault at `path`, deriving its key from
-    /// `identity_secret`.
-    ///
-    /// A vault created under one identity cannot be opened by another: the
-    /// derived key differs, so every record fails authentication.
     pub fn open(
         path: impl AsRef<std::path::Path>,
         identity_secret: &[u8],
@@ -90,8 +52,6 @@ impl Vault {
     fn from_connection(conn: Connection, identity_secret: &[u8]) -> MessagingResult<Self> {
         conn.execute_batch(SCHEMA)?;
 
-        // Reuse the existing salt, or mint one on first open. Regenerating it
-        // would silently orphan every record already written.
         let salt: Vec<u8> = match conn
             .query_row(
                 "SELECT value FROM meta WHERE key = ?1",
@@ -122,7 +82,6 @@ impl Vault {
         })
     }
 
-    /// Binds a ciphertext to its slot, so records cannot be moved between keys.
     fn aad(namespace: &str, key: &[u8]) -> Vec<u8> {
         let mut aad = Vec::with_capacity(namespace.len() + key.len() + 1);
         aad.extend_from_slice(namespace.as_bytes());
@@ -210,10 +169,6 @@ impl Vault {
             .is_some())
     }
 
-    /// Keys in a namespace beginning with `prefix`, in order.
-    ///
-    /// Conversation history is keyed by peer-then-timestamp, so a prefix scan
-    /// is how one conversation is read without decrypting every other.
     pub fn keys_with_prefix(&self, namespace: &str, prefix: &[u8]) -> MessagingResult<Vec<Vec<u8>>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -228,7 +183,6 @@ impl Vault {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Every key in a namespace. Values stay encrypted until asked for.
     pub fn keys(&self, namespace: &str) -> MessagingResult<Vec<Vec<u8>>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
@@ -300,7 +254,6 @@ mod tests {
         assert_eq!(v.keys("session").unwrap(), vec![b"3".to_vec()]);
     }
 
-    /// Nothing readable may reach the disk.
     #[test]
     fn stored_bytes_are_not_the_plaintext() {
         let v = vault();
@@ -316,11 +269,8 @@ mod tests {
         );
     }
 
-    /// Pull the drive, and the vault is inert.
     #[test]
     fn a_different_identity_cannot_read_the_vault() {
-        // Same connection would be needed to share the salt, so this is tested
-        // through a file the two opens share.
         let dir = std::env::temp_dir().join(format!("wisp-vault-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("vault.db");
@@ -342,8 +292,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Reopening with the right secret must still work — the salt has to be
-    /// reused, not regenerated.
     #[test]
     fn the_vault_survives_being_reopened() {
         let dir = std::env::temp_dir().join(format!("wisp-vault-reopen-{}", std::process::id()));
@@ -364,7 +312,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A record lifted into another slot must not decrypt there.
     #[test]
     fn ciphertexts_cannot_be_moved_between_slots() {
         let v = vault();
@@ -379,7 +326,6 @@ mod tests {
             )
             .unwrap();
 
-        // Same namespace, different key.
         v.conn.lock().unwrap()
             .execute(
                 "INSERT INTO records (namespace, key, nonce, ciphertext) VALUES (?1, ?2, ?3, ?4)",

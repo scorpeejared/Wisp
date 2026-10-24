@@ -1,13 +1,3 @@
-//! Windows removable volume enumeration and device identifier queries.
-//!
-//! Drive letters come from `GetLogicalDrives`, the filesystem volume serial
-//! from `GetVolumeInformationW`, and the device serial from
-//! `IOCTL_STORAGE_QUERY_PROPERTY` against `\\.\X:`.
-//!
-//! The device handle is opened with **zero** desired access. That is enough for
-//! a property query and — unlike `GENERIC_READ` — does not require
-//! Administrator, so the access gate works for a normal user account.
-
 use std::ffi::c_void;
 use std::path::PathBuf;
 
@@ -30,7 +20,6 @@ use crate::{format_volume_serial, RemovableVolume, Result, UsbError};
 const DRIVE_REMOVABLE: u32 = 2;
 const DRIVE_FIXED: u32 = 3;
 
-/// Closes its handle on every exit path, including early `?` returns.
 struct OwnedHandle(HANDLE);
 
 impl Drop for OwnedHandle {
@@ -67,10 +56,6 @@ pub fn list_removable() -> Result<Vec<RemovableVolume>> {
         let wide_root = to_wide(&root);
 
         let drive_type = unsafe { GetDriveTypeW(PCWSTR(wide_root.as_ptr())) };
-        // Network shares, optical drives, and RAM disks can never be the key
-        // drive. Fixed drives are still queried, because plenty of USB SSDs and
-        // some flash drives enumerate as fixed rather than removable, and
-        // refusing those would reject hardware that works perfectly well.
         if drive_type != DRIVE_REMOVABLE && drive_type != DRIVE_FIXED {
             continue;
         }
@@ -80,8 +65,6 @@ pub fn list_removable() -> Result<Vec<RemovableVolume>> {
             continue;
         }
 
-        // A card reader with no card, or a drive that vanished mid-scan, fails
-        // here. That is a normal race, not an error worth surfacing.
         let Some((label, volume_serial)) = volume_info(&wide_root) else {
             continue;
         };
@@ -101,8 +84,6 @@ pub fn list_removable() -> Result<Vec<RemovableVolume>> {
     Ok(volumes)
 }
 
-/// Reads the label and 32-bit volume serial, or `None` if the volume is not
-/// readable right now.
 fn volume_info(wide_root: &[u16]) -> Option<(Option<String>, u32)> {
     let mut label_buf = [0u16; 256];
     let mut serial: u32 = 0;
@@ -123,15 +104,12 @@ fn volume_info(wide_root: &[u16]) -> Option<(Option<String>, u32)> {
     Some((if label.is_empty() { None } else { Some(label) }, serial))
 }
 
-/// Queries the storage device behind a drive letter.
 fn query_device(letter: char) -> Option<DeviceInfo> {
     let path = to_wide(&format!(r"\\.\{letter}:"));
 
     let handle = unsafe {
         CreateFileW(
             PCWSTR(path.as_ptr()),
-            // Zero access: enough to query properties, and avoids needing
-            // Administrator rights.
             0,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
@@ -149,7 +127,6 @@ fn query_device(letter: char) -> Option<DeviceInfo> {
         AdditionalParameters: [0],
     };
 
-    // Large enough for the descriptor plus its trailing string block.
     let mut buf = vec![0u8; 2048];
     let mut returned: u32 = 0;
 
@@ -170,19 +147,11 @@ fn query_device(letter: char) -> Option<DeviceInfo> {
     parse_device_descriptor(&buf[..returned as usize])
 }
 
-/// Extracts the identifier strings from a `STORAGE_DEVICE_DESCRIPTOR`.
-///
-/// The descriptor is a fixed header followed by a block of NUL-terminated
-/// ASCII, referenced by byte offsets from the start of the buffer. Every offset
-/// is bounds-checked: this is data from a device, and a malformed or hostile
-/// descriptor must not be able to read past the buffer.
 fn parse_device_descriptor(buf: &[u8]) -> Option<DeviceInfo> {
     if buf.len() < std::mem::size_of::<STORAGE_DEVICE_DESCRIPTOR>() {
         return None;
     }
 
-    // `read_unaligned`: `buf` is a `Vec<u8>` and carries no alignment
-    // guarantee for the descriptor type.
     let descriptor: STORAGE_DEVICE_DESCRIPTOR =
         unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const STORAGE_DEVICE_DESCRIPTOR) };
 
@@ -238,13 +207,11 @@ mod tests {
         assert!(parse_device_descriptor(&[0u8; 8]).is_none());
     }
 
-    /// Offsets come from the device and must never be trusted.
     #[test]
     fn descriptor_parsing_survives_hostile_offsets() {
         let size = std::mem::size_of::<STORAGE_DEVICE_DESCRIPTOR>();
         let mut buf = vec![0u8; size + 32];
 
-        // SerialNumberOffset far past the end of the buffer.
         let serial_offset = std::mem::offset_of!(STORAGE_DEVICE_DESCRIPTOR, SerialNumberOffset);
         buf[serial_offset..serial_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
 
@@ -252,22 +219,18 @@ mod tests {
         assert!(info.serial.is_none(), "out-of-range offset must be ignored");
     }
 
-    /// An unterminated string block must stop at the buffer end, not run off it.
     #[test]
     fn descriptor_parsing_handles_a_missing_terminator() {
         let size = std::mem::size_of::<STORAGE_DEVICE_DESCRIPTOR>();
         let mut buf = vec![0u8; size + 8];
         let serial_offset = std::mem::offset_of!(STORAGE_DEVICE_DESCRIPTOR, SerialNumberOffset);
         buf[serial_offset..serial_offset + 4].copy_from_slice(&(size as u32).to_le_bytes());
-        // Fill the tail with non-NUL bytes.
         buf[size..].fill(b'A');
 
         let info = parse_device_descriptor(&buf).unwrap();
         assert_eq!(info.serial.as_deref(), Some("AAAAAAAA"));
     }
 
-    /// Exercises the real platform API. Asserts only invariants that hold with
-    /// or without a USB drive plugged in, so it is not machine-dependent.
     #[test]
     fn enumerating_the_real_machine_is_well_formed() {
         let volumes = list_removable().expect("enumeration should not fail");
@@ -281,8 +244,6 @@ mod tests {
                 volume.identifiers.volume_serial.is_some(),
                 "a listed volume always has a filesystem serial"
             );
-            // Whatever we listed must be bindable, or the registration flow
-            // would offer the user a drive it cannot actually use.
             assert!(
                 volume.identifiers.strength().is_ok(),
                 "listed volume is not bindable: {:?}",

@@ -1,28 +1,3 @@
-//! Conversation history, encrypted at rest.
-//!
-//! Signal gives forward secrecy on the wire: past traffic cannot be decrypted
-//! from a compromised session key. Stored plaintext throws that away — an
-//! attacker who reads the database gets every message regardless of how good
-//! the ratchet was. So history lives in the same [`Vault`] as session state,
-//! under the same key derived from the USB-held identity.
-//!
-//! # Keys
-//!
-//! ```text
-//! peer (32 bytes) || sent_at millis (8, big-endian) || nonce (4)
-//! ```
-//!
-//! Peer first so one conversation is a prefix scan rather than a full decrypt
-//! of everything. Timestamp next, big-endian, so lexicographic key order *is*
-//! chronological order. The nonce breaks ties — two messages in the same
-//! millisecond would otherwise collide and one would silently overwrite the
-//! other.
-//!
-//! # No history endpoint exists on the relay
-//!
-//! This is the only copy. The relay deletes on delivery, so a lost vault is a
-//! lost conversation — which is the intended behaviour, not a gap.
-
 use crate::error::{MessagingError, MessagingResult};
 use crate::vault::Vault;
 use wisp_core::crypto;
@@ -32,18 +7,12 @@ const NS_GROUP_MESSAGE: &str = "group_message";
 const GROUP_KEY_LEN: usize = 16 + 8 + 4;
 const KEY_LEN: usize = 32 + 8 + 4;
 const RECORD_VERSION: u8 = 1;
-/// Generous for a chat message, and a bound on what a hostile relay can make
-/// us store from one envelope.
 const MAX_BODY_BYTES: usize = 16 * 1024;
 
-/// One message in a conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
-    /// The other party's identity key.
     pub peer: [u8; 32],
-    /// True if we sent it.
     pub outgoing: bool,
-    /// Milliseconds since the Unix epoch.
     pub sent_at: u64,
     pub body: String,
 }
@@ -75,11 +44,6 @@ impl Message {
     }
 }
 
-/// One message in a group.
-///
-/// Carries the sender explicitly, which a one-to-one message does not need:
-/// there the peer *is* the other party, but in a group any member could have
-/// written it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupMessage {
     pub group: uuid::Uuid,
@@ -119,7 +83,6 @@ impl GroupMessage {
     }
 }
 
-/// Encrypted conversation storage.
 pub struct History<'v> {
     vault: &'v Vault,
 }
@@ -145,7 +108,6 @@ impl<'v> History<'v> {
         )
     }
 
-    /// One conversation, oldest first.
     pub fn conversation(&self, peer: &[u8; 32]) -> MessagingResult<Vec<Message>> {
         let keys = self.vault.keys_with_prefix(NS_MESSAGE, peer)?;
 
@@ -166,10 +128,6 @@ impl<'v> History<'v> {
         Ok(messages)
     }
 
-    /// Every peer we have history with, for the chat list.
-    ///
-    /// Derived from stored keys rather than a separate index, so the list can
-    /// never disagree with what is actually stored.
     pub fn peers(&self) -> MessagingResult<Vec<[u8; 32]>> {
         let mut peers: Vec<[u8; 32]> = self
             .vault
@@ -195,7 +153,6 @@ impl<'v> History<'v> {
             .put(NS_GROUP_MESSAGE, &key, &message.encode()?)
     }
 
-    /// One group's messages, oldest first.
     pub fn group_conversation(&self, group: &uuid::Uuid) -> MessagingResult<Vec<GroupMessage>> {
         let keys = self
             .vault
@@ -226,7 +183,6 @@ impl<'v> History<'v> {
         Ok(keys.len())
     }
 
-    /// Deletes a conversation.
     pub fn forget(&self, peer: &[u8; 32]) -> MessagingResult<usize> {
         let keys = self.vault.keys_with_prefix(NS_MESSAGE, peer)?;
         for key in &keys {
@@ -271,7 +227,6 @@ mod tests {
         let vault = vault();
         let history = History::new(&vault);
 
-        // Appended out of order.
         history.append(&message(ALICE, true, 300, "third")).unwrap();
         history.append(&message(ALICE, false, 100, "first")).unwrap();
         history.append(&message(ALICE, true, 200, "second")).unwrap();
@@ -285,7 +240,6 @@ mod tests {
         assert_eq!(bodies, vec!["first", "second", "third"]);
     }
 
-    /// Two messages in the same millisecond must both survive.
     #[test]
     fn simultaneous_messages_do_not_overwrite_each_other() {
         let vault = vault();
@@ -356,7 +310,6 @@ mod tests {
         assert_eq!(history.conversation(&BOB).unwrap().len(), 1);
     }
 
-    /// Forward secrecy on the wire is undone by plaintext on disk.
     #[test]
     fn message_bodies_are_not_stored_in_the_clear() {
         let vault = vault();
@@ -365,10 +318,6 @@ mod tests {
             .unwrap();
 
         let key = vault.keys(NS_MESSAGE).unwrap().remove(0);
-        // The vault's own accessor decrypts; the point is that the stored bytes
-        // differ from the plaintext, which `stored_bytes_are_not_the_plaintext`
-        // in the vault tests proves directly. Here we confirm the round trip
-        // goes through that path at all.
         assert_ne!(vault.get(NS_MESSAGE, &key).unwrap().unwrap(), b"MEET AT MIDNIGHT");
     }
 
